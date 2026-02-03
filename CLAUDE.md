@@ -5,7 +5,8 @@ Building an automated trading system with Interactive Brokers integration.
 
 ## Current State
 - Basic project structure created
-- Currently using `ccxt` (crypto exchanges) - needs refactoring to use `ib_insync` for Interactive Brokers
+- Refactored to use `ib_insync` for Interactive Brokers
+- Configured for paper trading (port 4002)
 - Simple moving average crossover strategy implemented
 - Docker setup ready
 
@@ -18,11 +19,12 @@ Building an automated trading system with Interactive Brokers integration.
 https://github.com/ThomasGit2000/trading-bot
 
 ## Next Steps
-1. Refactor `bot.py` to use `ib_insync` instead of `ccxt`
-2. Update `requirements.txt` with IB dependencies
-3. Implement proper IB connection handling
-4. Add real trading strategies
-5. Deploy to Raspberry Pi 5 (see DEPLOYMENT.md)
+1. ~~Refactor `bot.py` to use `ib_insync` instead of `ccxt`~~ DONE
+2. ~~Update `requirements.txt` with IB dependencies~~ DONE
+3. ~~Implement proper IB connection handling~~ DONE
+4. Test with IBKR paper trading account
+5. Add real trading strategies
+6. Deploy to Raspberry Pi 5 (see DEPLOYMENT.md)
 
 ## Deployment
 Target: Raspberry Pi 5
