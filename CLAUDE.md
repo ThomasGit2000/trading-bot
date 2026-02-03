@@ -22,6 +22,11 @@ https://github.com/ThomasGit2000/trading-bot
 2. Update `requirements.txt` with IB dependencies
 3. Implement proper IB connection handling
 4. Add real trading strategies
+5. Deploy to Raspberry Pi 5 (see DEPLOYMENT.md)
+
+## Deployment
+Target: Raspberry Pi 5
+See `DEPLOYMENT.md` for full instructions.
 
 ## Project Structure
 ```
