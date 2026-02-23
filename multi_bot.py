@@ -59,8 +59,7 @@ class StockTrader:
         short_ma = 0
         long_ma = 0
         signal = "WAIT"
-        buy_probability = 0
-        sell_probability = 0
+        signal_strength = 0
 
         if len(self.strategy.prices) >= self.strategy.short_window:
             short_ma = sum(list(self.strategy.prices)[-self.strategy.short_window:]) / self.strategy.short_window
@@ -68,8 +67,8 @@ class StockTrader:
             long_ma = sum(list(self.strategy.prices)[-self.strategy.long_window:]) / self.strategy.long_window
             signal = self.strategy.get_signal()
 
-            # Calculate crossover probability
-            buy_probability, sell_probability = self._calculate_probability(short_ma, long_ma)
+            # Calculate signal strength (-100 to +100)
+            signal_strength, _ = self._calculate_probability(short_ma, long_ma)
 
         return {
             'symbol': self.symbol,
@@ -84,48 +83,49 @@ class StockTrader:
             'prices_collected': len(self.strategy.prices),
             'data_source': self.data_source,
             'in_position': self.strategy.in_position,
-            'buy_probability': buy_probability,
-            'sell_probability': sell_probability,
+            'signal_strength': signal_strength,
             'upcoming_events': self.upcoming_events,
             'news': self.news
         }
 
     def _calculate_probability(self, short_ma: float, long_ma: float) -> tuple:
         """
-        Calculate probability of buy/sell signal based on MA convergence.
-        Returns (buy_prob, sell_prob) as percentages 0-100.
+        Calculate signal strength based on MA crossover thresholds.
+        Shows how close we are to actual BUY or SELL signals.
+
+        Scale: -100 (SELL signal) to +100 (BUY signal)
+        - BUY triggers at: short_ma > long_ma * 1.01 (1% above)
+        - SELL triggers at: short_ma < long_ma * 0.99 (1% below)
         """
-        if long_ma == 0 or self.last_price == 0:
+        if long_ma == 0:
             return (0, 0)
 
-        # Gap between MAs as percentage of price
-        gap_pct = abs(short_ma - long_ma) / self.last_price * 100
+        threshold = 0.01  # 1% threshold matching strategy
 
-        # Calculate momentum (rate of change) using recent prices
-        prices = list(self.strategy.prices)
-        momentum = 0
-        if len(prices) >= 5:
-            recent_avg = sum(prices[-5:]) / 5
-            older_avg = sum(prices[-10:-5]) / 5 if len(prices) >= 10 else recent_avg
-            momentum = (recent_avg - older_avg) / self.last_price * 100
+        # Calculate the thresholds
+        buy_threshold = long_ma * (1 + threshold)
+        sell_threshold = long_ma * (1 - threshold)
 
-        # Base probability: inversely proportional to gap
-        # At 0% gap = 95% probability, at 1% gap = ~50%, at 2%+ gap = low
-        base_prob = max(0, min(95, 95 - (gap_pct * 45)))
+        # Range between thresholds
+        threshold_range = buy_threshold - sell_threshold
 
-        # Adjust based on momentum and direction
-        if short_ma < long_ma:
-            # Below long MA - potential BUY
-            # Positive momentum increases buy probability
-            buy_prob = min(95, base_prob + (momentum * 20))
-            sell_prob = max(0, 100 - buy_prob - 10)  # Lower sell prob
+        if threshold_range == 0:
+            return (0, 0)
+
+        # Where is short_ma relative to the thresholds?
+        if short_ma >= buy_threshold:
+            # Above buy threshold = BUY signal active
+            signal = 100
+        elif short_ma <= sell_threshold:
+            # Below sell threshold = SELL signal active
+            signal = -100
         else:
-            # Above long MA - potential SELL
-            # Negative momentum increases sell probability
-            sell_prob = min(95, base_prob - (momentum * 20))
-            buy_prob = max(0, 100 - sell_prob - 10)  # Lower buy prob
+            # Between thresholds: scale linearly
+            # sell_threshold = -100, long_ma = 0, buy_threshold = +100
+            position = (short_ma - sell_threshold) / threshold_range
+            signal = (position * 200) - 100  # Scale 0-1 to -100 to +100
 
-        return (round(max(0, buy_prob), 1), round(max(0, sell_prob), 1))
+        return (round(signal, 1), 0)
 
 
 class MultiStockBot:

@@ -131,13 +131,19 @@ class YFinanceClient:
 
             # Simple sentiment keywords
             positive_words = ['surge', 'jump', 'gain', 'rise', 'soar', 'rally', 'beat', 'profit',
-                            'growth', 'upgrade', 'buy', 'bullish', 'record', 'strong', 'boost']
+                            'growth', 'upgrade', 'buy', 'bullish', 'record', 'strong', 'boost', 'win']
             negative_words = ['fall', 'drop', 'crash', 'decline', 'loss', 'miss', 'cut', 'sell',
-                            'downgrade', 'bearish', 'weak', 'warning', 'concern', 'risk', 'lawsuit']
+                            'downgrade', 'bearish', 'weak', 'warning', 'concern', 'risk', 'lawsuit', 'fear']
 
             results = []
             for article in news[:limit]:
-                title = article.get('title', '')
+                # Handle new yfinance format (nested under 'content')
+                content = article.get('content', article)
+
+                title = content.get('title', '')
+                if not title:
+                    continue
+
                 title_lower = title.lower()
 
                 # Simple sentiment scoring
@@ -151,21 +157,32 @@ class YFinanceClient:
                 else:
                     sentiment = 'neutral'
 
-                # Get publish time
-                pub_time = article.get('providerPublishTime', 0)
-                if pub_time:
-                    from datetime import datetime
-                    pub_date = datetime.fromtimestamp(pub_time)
-                    time_ago = self._time_ago(pub_date)
-                else:
-                    time_ago = ''
+                # Get publish time (new format uses pubDate string)
+                pub_time_str = content.get('pubDate', '')
+                time_ago = ''
+                if pub_time_str:
+                    try:
+                        from datetime import datetime
+                        pub_date = datetime.fromisoformat(pub_time_str.replace('Z', '+00:00'))
+                        pub_date = pub_date.replace(tzinfo=None)
+                        time_ago = self._time_ago(pub_date)
+                    except:
+                        pass
+
+                # Get source from provider
+                provider = content.get('provider', {})
+                source = provider.get('displayName', 'Unknown') if isinstance(provider, dict) else 'Unknown'
+
+                # Get link from canonicalUrl
+                canonical = content.get('canonicalUrl', {})
+                link = canonical.get('url', '') if isinstance(canonical, dict) else ''
 
                 results.append({
                     'title': title[:80] + ('...' if len(title) > 80 else ''),
-                    'source': article.get('publisher', 'Unknown'),
+                    'source': source,
                     'sentiment': sentiment,
                     'time_ago': time_ago,
-                    'link': article.get('link', '')
+                    'link': link
                 })
 
             return results
