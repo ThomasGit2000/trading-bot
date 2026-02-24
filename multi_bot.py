@@ -1,18 +1,35 @@
 """
 Multi-Stock Trading Bot with NO STOPS Strategy
 Trades multiple symbols simultaneously using MA crossover signals.
+Supports categorized stock universe for organized trading.
 """
 import os
+import sys
 import json
 import time
 import logging
 import threading
+import subprocess
 from datetime import datetime
 from dotenv import load_dotenv
 from ib_insync import IB, Stock, LimitOrder
 from src.strategy import SimpleStrategy
 from src.dashboard_state import bot_state
 from src.yfinance_client import YFinanceClient
+
+# Import stock universe for category support
+try:
+    from stock_universe import (
+        STOCK_CATEGORIES,
+        get_all_symbols,
+        get_symbols_by_category,
+        get_symbol_category,
+        get_position_size,
+        generate_position_sizes_json
+    )
+    UNIVERSE_AVAILABLE = True
+except ImportError:
+    UNIVERSE_AVAILABLE = False
 
 # Setup logging
 logging.basicConfig(
@@ -31,9 +48,10 @@ load_dotenv()
 class StockTrader:
     """Manages trading for a single stock"""
 
-    def __init__(self, symbol: str, position_size: int, short_ma: int, long_ma: int):
+    def __init__(self, symbol: str, position_size: int, short_ma: int, long_ma: int, category: str = "UNCATEGORIZED"):
         self.symbol = symbol
         self.position_size = position_size
+        self.category = category
         self.strategy = SimpleStrategy(
             short_window=short_ma,
             long_window=long_ma,
@@ -47,6 +65,7 @@ class StockTrader:
         self.last_price = 0
         self.last_bid = 0
         self.last_ask = 0
+        self.previous_close = 0
         self.ticker = None
         self.data_source = 'UNKNOWN'
         # Events and news
@@ -72,9 +91,11 @@ class StockTrader:
 
         return {
             'symbol': self.symbol,
+            'category': self.category,
             'price': self.last_price,
             'bid': self.last_bid,
             'ask': self.last_ask,
+            'previous_close': self.previous_close,
             'position': self.position,
             'position_size': self.position_size,
             'short_ma': short_ma,
@@ -137,15 +158,42 @@ class MultiStockBot:
         self.port = int(os.getenv('IB_PORT', '7496'))
         self.client_id = int(os.getenv('IB_CLIENT_ID', '1'))
 
-        # Parse symbols
+        # Parse symbols - support both direct symbols and categories
         symbols_str = os.getenv('SYMBOLS', 'TSLA,NIO')
-        self.symbols = [s.strip() for s in symbols_str.split(',')]
+        categories_str = os.getenv('CATEGORIES', '')
 
-        # Parse position sizes
-        pos_sizes_str = os.getenv('POSITION_SIZES', '{}')
-        try:
-            self.position_sizes = json.loads(pos_sizes_str)
-        except:
+        self.symbols = []
+        self.symbol_categories = {}  # Track which category each symbol belongs to
+
+        # Load from categories if specified and universe is available
+        if categories_str and UNIVERSE_AVAILABLE:
+            categories = [c.strip() for c in categories_str.split(',') if c.strip()]
+            if 'ALL' in categories:
+                self.symbols = get_all_symbols()
+            else:
+                for cat in categories:
+                    cat_symbols = get_symbols_by_category(cat)
+                    for sym in cat_symbols:
+                        if sym not in self.symbols:
+                            self.symbols.append(sym)
+                            self.symbol_categories[sym] = cat
+            logger.info(f"Loaded {len(self.symbols)} symbols from categories: {categories}")
+        else:
+            # Fall back to direct symbol list
+            self.symbols = [s.strip() for s in symbols_str.split(',') if s.strip()]
+
+        # Parse position sizes - auto-generate from categories if not specified
+        pos_sizes_str = os.getenv('POSITION_SIZES', '')
+        if pos_sizes_str:
+            try:
+                self.position_sizes = json.loads(pos_sizes_str)
+            except:
+                self.position_sizes = {}
+        elif UNIVERSE_AVAILABLE:
+            # Auto-generate position sizes based on categories
+            self.position_sizes = generate_position_sizes_json(self.symbols)
+            logger.info("Auto-generated position sizes from stock universe")
+        else:
             self.position_sizes = {}
 
         # Strategy settings
@@ -168,13 +216,22 @@ class MultiStockBot:
         self.traders = {}
         for symbol in self.symbols:
             pos_size = self.position_sizes.get(symbol, 10)
+            # Get category from tracking dict or lookup from universe
+            if symbol in self.symbol_categories:
+                category = self.symbol_categories[symbol]
+            elif UNIVERSE_AVAILABLE:
+                category = get_symbol_category(symbol)
+            else:
+                category = "UNCATEGORIZED"
+
             self.traders[symbol] = StockTrader(
                 symbol=symbol,
                 position_size=pos_size,
                 short_ma=self.short_ma,
-                long_ma=self.long_ma
+                long_ma=self.long_ma,
+                category=category
             )
-            logger.info(f"Created trader for {symbol} (size: {pos_size})")
+            logger.info(f"Created trader for {symbol} [{category}] (size: {pos_size})")
 
         self.last_price_time = 0
         self.last_trade_time = 0
@@ -214,6 +271,7 @@ class MultiStockBot:
                 trader.last_price = quote['price']
                 trader.last_bid = quote['price']
                 trader.last_ask = quote['price']
+                trader.previous_close = quote.get('previous_close', 0)
                 trader.data_source = 'YFINANCE'
                 return quote['price']
         except Exception as e:
@@ -251,26 +309,41 @@ class MultiStockBot:
             return False
 
     def collect_prices(self):
-        """Collect prices for all stocks"""
-        for symbol, trader in self.traders.items():
-            price = self.get_price(trader)
-            if price:
-                trader.strategy.add_price(price)
-                logger.debug(f"{symbol}: ${price:.2f} (collected: {len(trader.strategy.prices)})")
+        """Collect prices for all stocks in background thread"""
+        def _collect():
+            collected = 0
+            for symbol, trader in self.traders.items():
+                price = self.get_price(trader)
+                if price:
+                    trader.strategy.add_price(price)
+                    collected += 1
+            if collected > 0:
+                logger.info(f"Collected prices for {collected}/{len(self.traders)} stocks")
+
+        thread = threading.Thread(target=_collect, daemon=True)
+        thread.start()
 
     def update_stock_info(self):
-        """Update events and news for all stocks (called less frequently)"""
-        current_time = time.time()
-        for symbol, trader in self.traders.items():
-            # Update every 5 minutes
-            if current_time - trader.last_info_update >= 300:
-                try:
-                    trader.upcoming_events = self.yfinance.get_upcoming_events(symbol)
-                    trader.news = self.yfinance.get_news(symbol, limit=3)
-                    trader.last_info_update = current_time
-                    logger.info(f"{symbol}: Updated events and news")
-                except Exception as e:
-                    logger.warning(f"Failed to update info for {symbol}: {e}")
+        """Update events and news for all stocks in background thread"""
+        def _update_info():
+            current_time = time.time()
+            updated = 0
+            for symbol, trader in self.traders.items():
+                # Update every 5 minutes
+                if current_time - trader.last_info_update >= 300:
+                    try:
+                        trader.upcoming_events = self.yfinance.get_upcoming_events(symbol)
+                        trader.news = self.yfinance.get_news(symbol, limit=3)
+                        trader.last_info_update = current_time
+                        updated += 1
+                    except Exception as e:
+                        pass  # Silently skip failed updates
+            if updated > 0:
+                logger.info(f"Updated news/events for {updated} stocks")
+
+        # Run in background thread to avoid blocking main loop
+        thread = threading.Thread(target=_update_info, daemon=True)
+        thread.start()
 
     def check_signals(self):
         """Check trading signals for all stocks"""
@@ -312,14 +385,25 @@ class MultiStockBot:
         for symbol, trader in self.traders.items():
             states.append(trader.get_state())
 
-        # Update shared state (will be read by dashboard)
-        bot_state.update(
-            multi_stock=True,
-            stocks=states,
-            is_connected=self.ib.isConnected(),
-            dry_run=self.dry_run,
-            last_update=datetime.now().isoformat()
-        )
+        state_data = {
+            'multi_stock': True,
+            'stocks': states,
+            'is_connected': self.ib.isConnected(),
+            'dry_run': self.dry_run,
+            'last_update': datetime.now().isoformat()
+        }
+
+        # Update in-memory state (for backward compat)
+        bot_state.update(**state_data)
+
+        # Also write to file for separate dashboard process
+        try:
+            import json
+            state_file = os.path.join(os.path.dirname(__file__), 'data', 'bot_state.json')
+            with open(state_file, 'w') as f:
+                json.dump(state_data, f)
+        except Exception:
+            pass  # Silently ignore file write errors
 
     def start(self):
         """Start the trading bot"""
@@ -335,7 +419,7 @@ class MultiStockBot:
             logger.error("Failed to connect. Exiting.")
             return
 
-        # Start dashboard
+        # Start dashboard in thread
         if self.enable_dashboard:
             from src.multi_dashboard import run_multi_dashboard
             dashboard_thread = threading.Thread(
