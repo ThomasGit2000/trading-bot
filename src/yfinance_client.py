@@ -1,20 +1,86 @@
-"""Yahoo Finance client for historical data"""
+"""Yahoo Finance client for historical data with caching"""
 import logging
+import time
 from datetime import datetime, timedelta
+from threading import Lock
 
 import yfinance as yf
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 logger = logging.getLogger(__name__)
 
+# Initialize VADER sentiment analyzer (shared across instances)
+_sentiment_analyzer = None
+
+def get_sentiment_analyzer():
+    """Lazy-load sentiment analyzer"""
+    global _sentiment_analyzer
+    if _sentiment_analyzer is None:
+        _sentiment_analyzer = SentimentIntensityAnalyzer()
+    return _sentiment_analyzer
+
 
 class YFinanceClient:
-    """Yahoo Finance client for free historical data"""
+    """Yahoo Finance client with caching and throttling to avoid rate limits"""
+
+    # Class-level cache shared across instances
+    _cache = {}
+    _cache_lock = Lock()
+
+    # Rate limiting
+    _last_request_time = 0
+    _rate_limit_lock = Lock()
+    MIN_REQUEST_INTERVAL = 0.5  # Minimum 500ms between requests
+
+    # Rate limit backoff
+    _rate_limited_until = 0
+
+    # Cache TTLs in seconds
+    CACHE_TTL_QUOTE = 60          # 1 minute for quotes
+    CACHE_TTL_INFO = 300          # 5 minutes for company info
+    CACHE_TTL_HISTORY = 300       # 5 minutes for history
+    CACHE_TTL_NEWS = 600          # 10 minutes for news
+    CACHE_TTL_EVENTS = 3600       # 1 hour for events
 
     def __init__(self):
-        logger.info("YFinance client initialized")
+        logger.info("YFinance client initialized (with caching and throttling)")
+
+    def _throttle(self):
+        """Ensure minimum interval between requests"""
+        with self._rate_limit_lock:
+            # Check if we're in rate limit backoff
+            if time.time() < YFinanceClient._rate_limited_until:
+                return False  # Still rate limited
+
+            elapsed = time.time() - YFinanceClient._last_request_time
+            if elapsed < self.MIN_REQUEST_INTERVAL:
+                time.sleep(self.MIN_REQUEST_INTERVAL - elapsed)
+            YFinanceClient._last_request_time = time.time()
+            return True
+
+    def _handle_rate_limit(self):
+        """Set backoff period when rate limited"""
+        # Back off for 60 seconds when rate limited
+        YFinanceClient._rate_limited_until = time.time() + 60
+        logger.warning("YFinance rate limit hit - backing off for 60 seconds")
+
+    def _get_cache(self, key: str):
+        """Get cached value if not expired"""
+        with self._cache_lock:
+            if key in self._cache:
+                value, expiry = self._cache[key]
+                if time.time() < expiry:
+                    return value
+                del self._cache[key]
+        return None
+
+    def _set_cache(self, key: str, value, ttl: int):
+        """Set cache with TTL"""
+        with self._cache_lock:
+            self._cache[key] = (value, time.time() + ttl)
 
     def get_history(self, symbol: str, period: str = "1y", interval: str = "1d") -> list:
-        """Get historical prices
+        """Get historical prices with caching
 
         Args:
             symbol: Stock symbol (e.g., 'NIO')
@@ -25,6 +91,14 @@ class YFinanceClient:
         Returns:
             List of dicts with: date, open, high, low, close, volume
         """
+        cache_key = f"history:{symbol}:{period}:{interval}"
+        cached = self._get_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        if not self._throttle():
+            return []  # Rate limited, return empty
+
         try:
             ticker = yf.Ticker(symbol)
             df = ticker.history(period=period, interval=interval)
@@ -45,19 +119,31 @@ class YFinanceClient:
                 })
 
             logger.info(f"YFinance: {len(prices)} bars for {symbol} ({period})")
+            self._set_cache(cache_key, prices, self.CACHE_TTL_HISTORY)
             return prices
 
         except Exception as e:
-            logger.error(f"YFinance error: {e}")
+            if 'RateLimit' in str(type(e).__name__) or 'rate' in str(e).lower():
+                self._handle_rate_limit()
+            else:
+                logger.error(f"YFinance error: {e}")
             return []
 
     def get_quote(self, symbol: str) -> dict:
-        """Get current quote"""
+        """Get current quote with caching"""
+        cache_key = f"quote:{symbol}"
+        cached = self._get_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        if not self._throttle():
+            return None  # Rate limited
+
         try:
             ticker = yf.Ticker(symbol)
             info = ticker.info
 
-            return {
+            result = {
                 'symbol': symbol,
                 'price': info.get('currentPrice') or info.get('regularMarketPrice', 0),
                 'open': info.get('open') or info.get('regularMarketOpen', 0),
@@ -69,37 +155,74 @@ class YFinanceClient:
                 'name': info.get('shortName', symbol),
                 'timestamp': datetime.now()
             }
+            self._set_cache(cache_key, result, self.CACHE_TTL_QUOTE)
+            return result
         except Exception as e:
-            logger.error(f"YFinance quote error: {e}")
+            if 'RateLimit' in str(type(e).__name__) or 'rate' in str(e).lower():
+                self._handle_rate_limit()
+            else:
+                logger.error(f"YFinance quote error: {e}")
             return None
 
     def get_info(self, symbol: str) -> dict:
-        """Get company info"""
+        """Get company info with caching"""
+        cache_key = f"info:{symbol}"
+        cached = self._get_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        if not self._throttle():
+            return {}  # Rate limited
+
         try:
             ticker = yf.Ticker(symbol)
-            return ticker.info
+            info = ticker.info
+            self._set_cache(cache_key, info, self.CACHE_TTL_INFO)
+            return info
         except Exception as e:
-            logger.error(f"YFinance info error: {e}")
+            if 'RateLimit' in str(type(e).__name__) or 'rate' in str(e).lower():
+                self._handle_rate_limit()
+            else:
+                logger.error(f"YFinance info error: {e}")
             return {}
 
     def get_upcoming_events(self, symbol: str) -> dict:
-        """Get upcoming events (earnings, dividends, etc.)"""
+        """Get upcoming events with caching (earnings, dividends, etc.)"""
+        cache_key = f"events:{symbol}"
+        cached = self._get_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        if not self._throttle():
+            return {}  # Rate limited
+
         try:
             ticker = yf.Ticker(symbol)
             events = {}
 
-            # Get earnings date
+            # Get earnings date - handle both old and new yfinance formats
             try:
                 calendar = ticker.calendar
-                if calendar is not None and not calendar.empty:
-                    if 'Earnings Date' in calendar.index:
-                        earnings_dates = calendar.loc['Earnings Date']
-                        if hasattr(earnings_dates, 'iloc') and len(earnings_dates) > 0:
-                            next_earnings = earnings_dates.iloc[0]
+                if calendar is not None:
+                    # New yfinance format: dict with 'Earnings Date' as list
+                    if isinstance(calendar, dict):
+                        earnings_dates = calendar.get('Earnings Date', [])
+                        if earnings_dates and len(earnings_dates) > 0:
+                            next_earnings = earnings_dates[0]
                             if hasattr(next_earnings, 'strftime'):
                                 events['earnings_date'] = next_earnings.strftime('%Y-%m-%d')
                             else:
-                                events['earnings_date'] = str(next_earnings)
+                                events['earnings_date'] = str(next_earnings)[:10]
+                    # Old format: DataFrame
+                    elif hasattr(calendar, 'empty') and not calendar.empty:
+                        if 'Earnings Date' in calendar.index:
+                            earnings_dates = calendar.loc['Earnings Date']
+                            if hasattr(earnings_dates, 'iloc') and len(earnings_dates) > 0:
+                                next_earnings = earnings_dates.iloc[0]
+                                if hasattr(next_earnings, 'strftime'):
+                                    events['earnings_date'] = next_earnings.strftime('%Y-%m-%d')
+                                else:
+                                    events['earnings_date'] = str(next_earnings)
             except Exception as e:
                 logger.debug(f"No calendar data for {symbol}: {e}")
 
@@ -112,16 +235,35 @@ class YFinanceClient:
                     if ex_div > datetime.now():
                         events['ex_dividend_date'] = ex_div.strftime('%Y-%m-%d')
                         events['dividend_rate'] = info.get('dividendRate', 0)
+                # Also check for dividendDate
+                elif info.get('dividendDate'):
+                    from datetime import datetime
+                    div_date = datetime.fromtimestamp(info['dividendDate'])
+                    if div_date > datetime.now():
+                        events['ex_dividend_date'] = div_date.strftime('%Y-%m-%d')
+                        events['dividend_rate'] = info.get('dividendRate', 0)
             except Exception as e:
                 logger.debug(f"No dividend data for {symbol}: {e}")
 
+            self._set_cache(cache_key, events, self.CACHE_TTL_EVENTS)
             return events
         except Exception as e:
-            logger.error(f"YFinance events error for {symbol}: {e}")
+            if 'RateLimit' in str(type(e).__name__) or 'rate' in str(e).lower():
+                self._handle_rate_limit()
+            else:
+                logger.error(f"YFinance events error for {symbol}: {e}")
             return {}
 
     def get_news(self, symbol: str, limit: int = 3) -> list:
-        """Get latest news with basic sentiment analysis"""
+        """Get latest news with VADER sentiment analysis and caching"""
+        cache_key = f"news:{symbol}:{limit}"
+        cached = self._get_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        if not self._throttle():
+            return []  # Rate limited
+
         try:
             ticker = yf.Ticker(symbol)
             news = ticker.news
@@ -129,11 +271,8 @@ class YFinanceClient:
             if not news:
                 return []
 
-            # Simple sentiment keywords
-            positive_words = ['surge', 'jump', 'gain', 'rise', 'soar', 'rally', 'beat', 'profit',
-                            'growth', 'upgrade', 'buy', 'bullish', 'record', 'strong', 'boost', 'win']
-            negative_words = ['fall', 'drop', 'crash', 'decline', 'loss', 'miss', 'cut', 'sell',
-                            'downgrade', 'bearish', 'weak', 'warning', 'concern', 'risk', 'lawsuit', 'fear']
+            # Get VADER sentiment analyzer
+            analyzer = get_sentiment_analyzer()
 
             results = []
             for article in news[:limit]:
@@ -144,18 +283,22 @@ class YFinanceClient:
                 if not title:
                     continue
 
-                title_lower = title.lower()
+                # Use VADER for sentiment analysis
+                # VADER returns scores: neg, neu, pos, compound (-1 to +1)
+                sentiment_scores = analyzer.polarity_scores(title)
+                compound = sentiment_scores['compound']
 
-                # Simple sentiment scoring
-                pos_count = sum(1 for w in positive_words if w in title_lower)
-                neg_count = sum(1 for w in negative_words if w in title_lower)
-
-                if pos_count > neg_count:
+                # Classify based on compound score
+                # Compound > 0.05: positive, < -0.05: negative, else neutral
+                if compound >= 0.05:
                     sentiment = 'positive'
-                elif neg_count > pos_count:
+                    sentiment_score = compound  # 0.05 to 1.0
+                elif compound <= -0.05:
                     sentiment = 'negative'
+                    sentiment_score = compound  # -1.0 to -0.05
                 else:
                     sentiment = 'neutral'
+                    sentiment_score = compound  # -0.05 to 0.05
 
                 # Get publish time (new format uses pubDate string)
                 pub_time_str = content.get('pubDate', '')
@@ -181,13 +324,18 @@ class YFinanceClient:
                     'title': title[:80] + ('...' if len(title) > 80 else ''),
                     'source': source,
                     'sentiment': sentiment,
+                    'sentiment_score': round(sentiment_score, 2),  # Add numeric score
                     'time_ago': time_ago,
                     'link': link
                 })
 
+            self._set_cache(cache_key, results, self.CACHE_TTL_NEWS)
             return results
         except Exception as e:
-            logger.error(f"YFinance news error for {symbol}: {e}")
+            if 'RateLimit' in str(type(e).__name__) or 'rate' in str(e).lower():
+                self._handle_rate_limit()
+            else:
+                logger.error(f"YFinance news error for {symbol}: {e}")
             return []
 
     def _time_ago(self, dt) -> str:

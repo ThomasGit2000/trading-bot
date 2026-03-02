@@ -11,6 +11,7 @@ import json
 
 from src.dashboard_state import bot_state
 from src.yfinance_client import YFinanceClient
+from src.trading_control import trading_control
 
 yf_client = YFinanceClient()
 
@@ -58,11 +59,38 @@ DASHBOARD_HTML = """
         .status-dry { background: #f0883e; }
         .status-disconnected { background: #da3633; }
 
+        .master-btn {
+            padding: 6px 16px; border-radius: 6px; font-size: 12px; font-weight: 700;
+            border: 2px solid; cursor: pointer; transition: all 0.2s;
+            text-transform: uppercase; letter-spacing: 0.5px;
+        }
+        .master-btn.trading-live {
+            background: #238636; border-color: #2ea043; color: white;
+            box-shadow: 0 0 10px rgba(35, 134, 54, 0.5);
+        }
+        .master-btn.trading-live:hover {
+            background: #2ea043; box-shadow: 0 0 15px rgba(35, 134, 54, 0.7);
+        }
+        .master-btn.trading-stopped {
+            background: #9e6a03; border-color: #bb8009; color: white;
+        }
+        .master-btn.trading-stopped:hover {
+            background: #bb8009;
+        }
+        .master-btn:disabled {
+            opacity: 0.5; cursor: not-allowed;
+        }
+
         table { width: 100%; border-collapse: collapse; }
         th {
             text-align: left; padding: 6px 8px; font-size: 10px;
             color: #8b949e; text-transform: uppercase; border-bottom: 1px solid #30363d;
         }
+        th.sortable { cursor: pointer; user-select: none; }
+        th.sortable:hover { color: #58a6ff; }
+        th.sortable .sort-arrow { font-size: 8px; margin-left: 2px; }
+        th.sortable.asc .sort-arrow::after { content: ' ▲'; }
+        th.sortable.desc .sort-arrow::after { content: ' ▼'; }
         td { padding: 8px; border-bottom: 1px solid #21262d; vertical-align: middle; }
         tr:hover { background: #161b22; cursor: pointer; }
         tr.has-position { border-left: 3px solid #238636; }
@@ -200,41 +228,97 @@ DASHBOARD_HTML = """
         .event-date { font-size: 14px; font-weight: 600; color: #58a6ff; }
         .event-label { font-size: 11px; color: #8b949e; }
         .event-days { font-size: 11px; color: #f0883e; }
+
+        .nav-btn {
+            padding: 6px 14px; border-radius: 6px; font-size: 12px; font-weight: 600;
+            background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
+            text-decoration: none; transition: all 0.2s;
+        }
+        .nav-btn:hover { background: #30363d; border-color: #58a6ff; color: #58a6ff; }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
     <div class="header">
-        <h1>Master Board - NO STOPS MA(10/30)</h1>
-        <div>
-            <span id="connection-status" class="status-badge status-disconnected">...</span>
-            <span id="trading-mode" class="status-badge status-dry">DRY</span>
+        <div style="display: flex; align-items: center; gap: 12px;">
+            <h1>Master Board - AGGRESSIVE MA(8/21)</h1>
+            <a href="/sectors" class="nav-btn">Sectors</a>
+        </div>
+        <div style="display: flex; gap: 8px; align-items: center;">
+            <span id="net-liq" class="status-badge" style="background:#1f6feb;font-weight:700;" title="Net Liquidation Value">
+                Net: -- DKK
+            </span>
+            <span id="excess-liq" class="status-badge" style="background:#238636;font-weight:700;" title="Excess Liquidity / Available Cash">
+                Cash: -- DKK
+            </span>
+            <button id="master-trading-btn" class="master-btn trading-stopped" onclick="toggleTrading()" title="Click to toggle trading">
+                TRADING STOPPED
+            </button>
+            <span id="market-status" class="status-badge" style="background:#6e7681;">MKT: --</span>
+            <span id="trade-stats" class="status-badge" style="background:#30363d;font-size:10px;" title="Verified/Pending/Failed trades">
+                Trades: <span id="trades-filled" style="color:#3fb950;">0</span>/<span id="trades-pending" style="color:#f0883e;">0</span>/<span id="trades-failed" style="color:#f85149;">0</span>
+            </span>
+            <span id="connection-status" class="status-badge status-disconnected" title="WebSocket Connection">WS: ...</span>
+            <span id="trading-mode" class="status-badge status-dry" title="Trading Mode">MODE: DRY</span>
         </div>
     </div>
 
     <table>
         <thead>
             <tr>
-                <th>Symbol</th>
-                <th>Category</th>
-                <th>Price</th>
-                <th>Pos</th>
-                <th>Target</th>
-                <th>Data</th>
-                <th>Signal</th>
-                <th>MA(10)</th>
-                <th>MA(30)</th>
-                <th>News</th>
+                <th style="width:30px;text-align:center;">#</th>
+                <th class="sortable" data-sort="symbol" onclick="sortTable('symbol')">Symbol <span class="sort-arrow"></span></th>
+                <th class="sortable" data-sort="category" onclick="sortTable('category')">Category <span class="sort-arrow"></span></th>
+                <th class="sortable" data-sort="days_to_event" onclick="sortTable('days_to_event')">Event <span class="sort-arrow"></span></th>
+                <th class="sortable" data-sort="price" onclick="sortTable('price')">Price <span class="sort-arrow"></span></th>
+                <th>24H</th>
+                <th class="sortable" data-sort="position" onclick="sortTable('position')">Pos <span class="sort-arrow"></span></th>
+                <th class="sortable" data-sort="position_size" onclick="sortTable('position_size')">Target <span class="sort-arrow"></span></th>
+                <th class="sortable" data-sort="prices_collected" onclick="sortTable('prices_collected')">Data <span class="sort-arrow"></span></th>
+                <th class="sortable" data-sort="signal" onclick="sortTable('signal')">Signal <span class="sort-arrow"></span></th>
+                <th class="sortable" data-sort="short_ma" onclick="sortTable('short_ma')">MA(8) <span class="sort-arrow"></span></th>
+                <th class="sortable" data-sort="long_ma" onclick="sortTable('long_ma')">MA(21) <span class="sort-arrow"></span></th>
+                <th class="sortable" data-sort="signal_strength" onclick="sortTable('signal_strength')">News <span class="sort-arrow"></span></th>
             </tr>
         </thead>
         <tbody id="stocks-body">
-            <tr><td colspan="10" style="text-align:center;color:#8b949e;">Loading...</td></tr>
+            <tr><td colspan="13" style="text-align:center;color:#8b949e;">Loading...</td></tr>
         </tbody>
     </table>
 
     <div class="footer">
         <span id="last-update">--</span>
         <span id="stock-count">0 stocks</span>
+        <span id="trade-summary" style="cursor:pointer;" onclick="toggleTradeHistory()">Trades: <span id="total-trades">0</span></span>
+    </div>
+
+    <!-- Trade History Panel -->
+    <div id="trade-history" style="display:none; margin-top:12px; background:#161b22; border-radius:6px; padding:12px; border:1px solid #30363d;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <span style="font-size:12px; font-weight:600;">Recent Trading Activity</span>
+            <span style="font-size:10px; color:#8b949e;">
+                Verified: <span id="stat-verified" style="color:#3fb950;">0</span> |
+                Pending: <span id="stat-pending" style="color:#f0883e;">0</span> |
+                Failed: <span id="stat-failed" style="color:#f85149;">0</span> |
+                Skipped: <span id="stat-skipped" style="color:#6e7681;">0</span>
+            </span>
+        </div>
+        <table style="width:100%; font-size:11px;">
+            <thead>
+                <tr>
+                    <th style="width:60px;">Time</th>
+                    <th>ID</th>
+                    <th>Symbol</th>
+                    <th>Action</th>
+                    <th>Qty</th>
+                    <th>Price</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody id="trade-history-body">
+                <tr><td colspan="7" style="text-align:center; color:#8b949e;">No trades yet</td></tr>
+            </tbody>
+        </table>
     </div>
 
     <!-- Stock Detail Modal -->
@@ -323,11 +407,12 @@ DASHBOARD_HTML = """
         let modalStockData = null;
         let priceChart = null;
         let latestStocksData = [];
+        let currentSort = { column: null, direction: 'asc' };
 
         function connect() {
             ws = new WebSocket(`ws://${window.location.host}/ws`);
             ws.onopen = () => {
-                document.getElementById('connection-status').textContent = 'LIVE';
+                document.getElementById('connection-status').textContent = 'WS: LIVE';
                 document.getElementById('connection-status').className = 'status-badge status-live';
             };
             ws.onmessage = (e) => {
@@ -340,7 +425,7 @@ DASHBOARD_HTML = """
                 }
             };
             ws.onclose = () => {
-                document.getElementById('connection-status').textContent = 'OFF';
+                document.getElementById('connection-status').textContent = 'WS: OFF';
                 document.getElementById('connection-status').className = 'status-badge status-disconnected';
                 setTimeout(connect, 2000);
             };
@@ -348,19 +433,203 @@ DASHBOARD_HTML = """
 
         function updateDashboard(data) {
             const mode = document.getElementById('trading-mode');
-            mode.textContent = data.dry_run ? 'DRY' : 'LIVE';
+            mode.textContent = data.dry_run ? 'MODE: DRY' : 'MODE: LIVE';
             mode.className = 'status-badge ' + (data.dry_run ? 'status-dry' : 'status-live');
+
+            // Update liquidity displays
+            if (data.net_liquidation_dkk !== undefined) {
+                document.getElementById('net-liq').textContent = `Net: ${data.net_liquidation_dkk.toLocaleString()} DKK`;
+            }
+            if (data.excess_liquidity_dkk !== undefined) {
+                document.getElementById('excess-liq').textContent = `Cash: ${data.excess_liquidity_dkk.toLocaleString()} DKK`;
+            }
+
+            // Master trading control
+            const masterBtn = document.getElementById('master-trading-btn');
+            if (data.trading_control) {
+                const enabled = data.trading_control.enabled;
+                masterBtn.textContent = enabled ? 'LIVE TRADING' : 'TRADING STOPPED';
+                masterBtn.className = 'master-btn ' + (enabled ? 'trading-live' : 'trading-stopped');
+            }
+
+            // Market status (with debounce to prevent flickering)
+            const mktStatus = document.getElementById('market-status');
+            const newMarketState = data.market_open ? 'OPEN' : 'CLOSED';
+            if (!window.lastMarketState) window.lastMarketState = newMarketState;
+            if (!window.marketStateCount) window.marketStateCount = 0;
+
+            // Only change if we get 3 consecutive same values
+            if (newMarketState === window.lastMarketState) {
+                window.marketStateCount++;
+            } else {
+                window.marketStateCount = 1;
+                window.lastMarketState = newMarketState;
+            }
+
+            if (window.marketStateCount >= 3) {
+                if (newMarketState === 'OPEN') {
+                    mktStatus.textContent = 'MKT: OPEN';
+                    mktStatus.style.background = '#238636';
+                } else {
+                    mktStatus.textContent = 'MKT: CLOSED';
+                    mktStatus.style.background = '#6e7681';
+                }
+            }
+
+            // Trading stats
+            if (data.trading && data.trading.stats) {
+                const stats = data.trading.stats;
+                document.getElementById('trades-filled').textContent = stats.verified || 0;
+                document.getElementById('trades-pending').textContent = stats.pending || 0;
+                document.getElementById('trades-failed').textContent = stats.failed || 0;
+                document.getElementById('total-trades').textContent = stats.total || 0;
+
+                // Update trade history panel stats
+                document.getElementById('stat-verified').textContent = stats.verified || 0;
+                document.getElementById('stat-pending').textContent = stats.pending || 0;
+                document.getElementById('stat-failed').textContent = stats.failed || 0;
+                document.getElementById('stat-skipped').textContent = stats.skipped || 0;
+            }
+
+            // Trade history
+            if (data.trading && data.trading.recent_trades) {
+                updateTradeHistory(data.trading.recent_trades);
+            }
 
             const body = document.getElementById('stocks-body');
             if (data.stocks && data.stocks.length > 0) {
-                body.innerHTML = data.stocks.map(createRow).join('');
+                let stocks = [...data.stocks];
+                if (currentSort.column) {
+                    stocks = sortStocks(stocks, currentSort.column, currentSort.direction);
+                }
+                body.innerHTML = stocks.map((s, i) => createRow(s, i + 1)).join('');
             }
 
             document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
             document.getElementById('stock-count').textContent = (data.stocks?.length || 0) + ' stocks';
         }
 
-        function createRow(s) {
+        function sortTable(column) {
+            // Toggle direction if same column
+            if (currentSort.column === column) {
+                currentSort.direction = currentSort.direction === 'asc' ? 'desc' : 'asc';
+            } else {
+                currentSort.column = column;
+                currentSort.direction = 'asc';
+            }
+
+            // Update header arrows
+            document.querySelectorAll('th.sortable').forEach(th => {
+                th.classList.remove('asc', 'desc');
+                if (th.dataset.sort === column) {
+                    th.classList.add(currentSort.direction);
+                }
+            });
+
+            // Re-render with sorted data
+            if (latestStocksData.length > 0) {
+                const sorted = sortStocks([...latestStocksData], column, currentSort.direction);
+                document.getElementById('stocks-body').innerHTML = sorted.map((s, i) => createRow(s, i + 1)).join('');
+            }
+        }
+
+        function sortStocks(stocks, column, direction) {
+            return stocks.sort((a, b) => {
+                let valA = a[column];
+                let valB = b[column];
+
+                // Handle special cases
+                if (column === 'signal') {
+                    const order = { 'BUY': 3, 'SELL': 2, 'HOLD': 1, 'WAIT': 0 };
+                    valA = order[valA] || 0;
+                    valB = order[valB] || 0;
+                }
+
+                if (column === 'days_to_event') {
+                    // Calculate days from upcoming_events
+                    valA = getDaysToEvent(a.upcoming_events);
+                    valB = getDaysToEvent(b.upcoming_events);
+                }
+
+                // Handle null/undefined
+                if (valA == null) valA = '';
+                if (valB == null) valB = '';
+
+                // Compare
+                let result;
+                if (typeof valA === 'number' && typeof valB === 'number') {
+                    result = valA - valB;
+                } else {
+                    result = String(valA).localeCompare(String(valB));
+                }
+
+                return direction === 'desc' ? -result : result;
+            });
+        }
+
+        function toggleTradeHistory() {
+            const panel = document.getElementById('trade-history');
+            panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+        }
+
+        async function toggleTrading() {
+            const btn = document.getElementById('master-trading-btn');
+            const currentlyEnabled = btn.classList.contains('trading-live');
+
+            // Confirm before enabling
+            if (!currentlyEnabled) {
+                if (!confirm('Enable LIVE TRADING?\\n\\nThis will allow the bot to place real orders when market is open.')) {
+                    return;
+                }
+            }
+
+            btn.disabled = true;
+            btn.textContent = 'UPDATING...';
+
+            try {
+                const res = await fetch('/api/trading/toggle', { method: 'POST' });
+                const data = await res.json();
+
+                btn.textContent = data.enabled ? 'LIVE TRADING' : 'TRADING STOPPED';
+                btn.className = 'master-btn ' + (data.enabled ? 'trading-live' : 'trading-stopped');
+            } catch (e) {
+                console.error('Failed to toggle trading:', e);
+                alert('Failed to toggle trading state');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        function updateTradeHistory(trades) {
+            const tbody = document.getElementById('trade-history-body');
+            if (!trades || trades.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:#8b949e;">No trades yet</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = trades.map(t => {
+                const time = new Date(t.timestamp).toLocaleTimeString();
+                const statusColor = {
+                    'VERIFIED': '#3fb950', 'FILLED': '#3fb950',
+                    'PENDING': '#f0883e',
+                    'FAILED': '#f85149', 'REJECTED': '#f85149', 'CANCELLED': '#f85149',
+                    'SKIPPED': '#6e7681'
+                }[t.status] || '#8b949e';
+                const actionColor = t.action === 'BUY' ? '#3fb950' : '#f85149';
+
+                return `<tr>
+                    <td>${time}</td>
+                    <td style="color:#58a6ff;">${t.id}</td>
+                    <td style="font-weight:600;">${t.symbol}</td>
+                    <td style="color:${actionColor};">${t.action}</td>
+                    <td>${t.quantity}</td>
+                    <td>$${t.price?.toFixed(2) || '--'}</td>
+                    <td style="color:${statusColor};">${t.status}${t.error_message ? ' (' + t.error_message + ')' : ''}</td>
+                </tr>`;
+            }).join('');
+        }
+
+        function createRow(s, rowNum) {
             const hasPos = s.position > 0;
             const sigPos = ((s.signal_strength || 0) + 100) / 200 * 100;
             const newsScore = getNewsSentiment(s.news);
@@ -385,12 +654,15 @@ DASHBOARD_HTML = """
 
             return `
                 <tr class="${hasPos ? 'has-position' : ''}" onclick="openModal('${s.symbol}', ${JSON.stringify(s).replace(/"/g, '&quot;')})">
+                    <td style="text-align:center;color:#8b949e;font-size:11px;">${rowNum}</td>
                     <td><span class="symbol">${s.symbol}</span></td>
                     <td class="category-cell">${catName}</td>
+                    <td>${formatEventDays(s.upcoming_events)}</td>
                     <td class="price ${priceClass}">$${s.price?.toFixed(2) || '--'}${changeStr}</td>
+                    <td>${createSparkline(s.price_history || [], s.price)}</td>
                     <td class="${hasPos ? 'position' : 'no-position'}">${s.position || 0}</td>
                     <td>${s.position_size}</td>
-                    <td>${s.prices_collected}/30</td>
+                    <td>${s.prices_collected}/21</td>
                     <td>
                         <span class="signal-label ${sigClass}">${s.signal || 'WAIT'}</span>
                         <div class="signal-bar"><div class="signal-indicator" style="left:${sigPos}%"></div></div>
@@ -404,14 +676,98 @@ DASHBOARD_HTML = """
             `;
         }
 
+        function formatEventDays(events) {
+            if (!events || !events.earnings_date) return '<span style="color:#8b949e;">--</span>';
+
+            // Calculate days until earnings
+            const earningsDate = new Date(events.earnings_date);
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            earningsDate.setHours(0, 0, 0, 0);
+            const diffTime = earningsDate - today;
+            const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+            let color, label;
+            if (diffDays < 0) {
+                return '<span style="color:#8b949e;">--</span>';
+            } else if (diffDays === 0) {
+                color = '#f85149';  // Red
+                label = 'TODAY';
+            } else if (diffDays <= 10) {
+                color = '#f0883e';  // Yellow/Orange
+                label = diffDays + 'D';
+            } else {
+                color = '#3fb950';  // Green
+                label = diffDays + 'D';
+            }
+
+            return `<span style="color:${color};font-weight:600;font-size:11px;" title="Earnings: ${events.earnings_date}">${label}</span>`;
+        }
+
+        function getDaysToEvent(events) {
+            if (!events || !events.earnings_date) return 9999;  // No event = sort to end
+            const earningsDate = new Date(events.earnings_date);
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            earningsDate.setHours(0, 0, 0, 0);
+            const diffTime = earningsDate - today;
+            const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+            return diffDays < 0 ? 9999 : diffDays;
+        }
+
+        function createSparkline(prices, currentPrice) {
+            if (!prices || prices.length < 2) {
+                return '<span style="color:#8b949e;font-size:10px;">--</span>';
+            }
+
+            const width = 60;
+            const height = 20;
+            const data = prices.slice(-30);  // Last 30 data points
+
+            const min = Math.min(...data);
+            const max = Math.max(...data);
+            const range = max - min || 1;
+
+            // Build SVG path
+            const points = data.map((p, i) => {
+                const x = (i / (data.length - 1)) * width;
+                const y = height - ((p - min) / range) * height;
+                return `${x},${y}`;
+            }).join(' ');
+
+            // Determine color: green if up, red if down
+            const isUp = data[data.length - 1] >= data[0];
+            const color = isUp ? '#3fb950' : '#f85149';
+
+            return `<svg width="${width}" height="${height}" style="vertical-align:middle;">
+                <polyline points="${points}" fill="none" stroke="${color}" stroke-width="1.5"/>
+            </svg>`;
+        }
+
         function getNewsSentiment(news) {
             if (!news || news.length === 0) return 0;
-            let score = 0;
+
+            // Use VADER sentiment_score if available (returns -1 to +1)
+            // Otherwise fall back to simple positive/negative counting
+            let totalScore = 0;
+            let count = 0;
+
             news.forEach(n => {
-                if (n.sentiment === 'positive') score += 33;
-                else if (n.sentiment === 'negative') score -= 33;
+                if (n.sentiment_score !== undefined) {
+                    // VADER compound score (-1 to +1), convert to -100 to +100
+                    totalScore += n.sentiment_score * 100;
+                    count++;
+                } else {
+                    // Fallback: simple counting
+                    if (n.sentiment === 'positive') totalScore += 50;
+                    else if (n.sentiment === 'negative') totalScore -= 50;
+                    count++;
+                }
             });
-            return Math.max(-100, Math.min(100, score));
+
+            // Average the sentiment scores
+            const avgScore = count > 0 ? totalScore / count : 0;
+            return Math.max(-100, Math.min(100, avgScore));
         }
 
         // Modal Functions
@@ -584,8 +940,28 @@ DASHBOARD_HTML = """
                     return dt.toLocaleDateString([], {month: 'short', day: 'numeric'});
                 });
                 const prices = data.data.map(d => d.close);
-                const ma10 = data.data.map(d => d.ma10);
-                const ma30 = data.data.map(d => d.ma30);
+                const ma8 = data.data.map(d => d.ma8);
+                const ma21 = data.data.map(d => d.ma21);
+
+                // Extract algo trading signals
+                const buySignals = new Array(data.data.length).fill(null);
+                const sellSignals = new Array(data.data.length).fill(null);
+
+                if (data.algo_signals && data.algo_signals.buy) {
+                    data.algo_signals.buy.forEach(signal => {
+                        if (signal.index < buySignals.length) {
+                            buySignals[signal.index] = signal.price;
+                        }
+                    });
+                }
+
+                if (data.algo_signals && data.algo_signals.sell) {
+                    data.algo_signals.sell.forEach(signal => {
+                        if (signal.index < sellSignals.length) {
+                            sellSignals[signal.index] = signal.price;
+                        }
+                    });
+                }
 
                 const ctx = document.getElementById('price-chart').getContext('2d');
 
@@ -609,8 +985,8 @@ DASHBOARD_HTML = """
                                 pointRadius: 0
                             },
                             {
-                                label: 'MA(10)',
-                                data: ma10,
+                                label: 'MA(8)',
+                                data: ma8,
                                 borderColor: '#f0883e',
                                 borderWidth: 1.5,
                                 borderDash: [5, 5],
@@ -619,14 +995,37 @@ DASHBOARD_HTML = """
                                 pointRadius: 0
                             },
                             {
-                                label: 'MA(30)',
-                                data: ma30,
+                                label: 'MA(21)',
+                                data: ma21,
                                 borderColor: '#58a6ff',
                                 borderWidth: 1.5,
                                 borderDash: [5, 5],
                                 fill: false,
                                 tension: 0.1,
                                 pointRadius: 0
+                            },
+                            {
+                                label: 'Algo Buy Signals',
+                                data: buySignals,
+                                type: 'scatter',
+                                backgroundColor: '#3fb950',
+                                borderColor: '#3fb950',
+                                pointRadius: 8,
+                                pointStyle: 'triangle',
+                                pointHoverRadius: 10,
+                                showLine: false
+                            },
+                            {
+                                label: 'Algo Sell Signals',
+                                data: sellSignals,
+                                type: 'scatter',
+                                backgroundColor: '#f85149',
+                                borderColor: '#f85149',
+                                pointRadius: 8,
+                                pointStyle: 'triangle',
+                                pointRotation: 180,
+                                pointHoverRadius: 10,
+                                showLine: false
                             }
                         ]
                     },
@@ -683,6 +1082,352 @@ DASHBOARD_HTML = """
 </html>
 """
 
+SECTORS_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sector Analysis</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+            background: #0d1117; color: #c9d1d9; padding: 20px;
+            font-size: 13px;
+        }
+        .header {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 20px; padding-bottom: 12px; border-bottom: 1px solid #30363d;
+        }
+        .header h1 { font-size: 18px; font-weight: 600; }
+        .nav-btn {
+            padding: 6px 14px; border-radius: 6px; font-size: 12px; font-weight: 600;
+            background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
+            text-decoration: none; transition: all 0.2s;
+        }
+        .nav-btn:hover { background: #30363d; border-color: #58a6ff; color: #58a6ff; }
+
+        .charts-container {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 24px;
+            margin-bottom: 24px;
+        }
+        @media (max-width: 900px) {
+            .charts-container { grid-template-columns: 1fr; }
+        }
+
+        .chart-card {
+            background: #161b22; border-radius: 8px; padding: 20px;
+            border: 1px solid #30363d;
+        }
+        .chart-title {
+            font-size: 14px; font-weight: 600; margin-bottom: 16px;
+            color: #c9d1d9;
+        }
+        .chart-wrapper {
+            position: relative; height: 350px;
+        }
+
+        .summary-stats {
+            display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;
+            margin-bottom: 24px;
+        }
+        .stat-card {
+            background: #161b22; border-radius: 8px; padding: 16px;
+            border: 1px solid #30363d; text-align: center;
+        }
+        .stat-value { font-size: 28px; font-weight: 700; color: #58a6ff; }
+        .stat-label { font-size: 11px; color: #8b949e; margin-top: 4px; }
+
+        .sector-table {
+            background: #161b22; border-radius: 8px; padding: 16px;
+            border: 1px solid #30363d;
+        }
+        .sector-table h3 { font-size: 14px; margin-bottom: 12px; }
+        table { width: 100%; border-collapse: collapse; }
+        th { text-align: left; padding: 8px; font-size: 10px; color: #8b949e;
+             text-transform: uppercase; border-bottom: 1px solid #30363d; }
+        td { padding: 10px 8px; border-bottom: 1px solid #21262d; }
+        tr:hover { background: #21262d; }
+        .sector-name { font-weight: 600; color: #58a6ff; }
+        .sector-bar {
+            height: 8px; background: #238636; border-radius: 4px;
+            min-width: 4px;
+        }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="header">
+        <h1>Sector Analysis</h1>
+        <a href="/" class="nav-btn">← Back to Dashboard</a>
+    </div>
+
+    <div class="summary-stats">
+        <div class="stat-card">
+            <div class="stat-value" id="total-stocks">--</div>
+            <div class="stat-label">Total Stocks</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" id="total-sectors">--</div>
+            <div class="stat-label">Sectors</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" id="total-invested">--</div>
+            <div class="stat-label">Total Invested</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" id="total-positions">--</div>
+            <div class="stat-label">Open Positions</div>
+        </div>
+    </div>
+
+    <div class="charts-container">
+        <div class="chart-card">
+            <div class="chart-title">Stocks per Sector</div>
+            <div class="chart-wrapper">
+                <canvas id="stocks-chart"></canvas>
+            </div>
+        </div>
+        <div class="chart-card">
+            <div class="chart-title">Invested Capital by Sector</div>
+            <div class="chart-wrapper">
+                <canvas id="capital-chart"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <div class="sector-table">
+        <h3>Sector Breakdown</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Sector</th>
+                    <th>Stocks</th>
+                    <th>Distribution</th>
+                    <th>Invested Capital</th>
+                    <th>Open Positions</th>
+                </tr>
+            </thead>
+            <tbody id="sector-body">
+                <tr><td colspan="5" style="text-align:center;color:#8b949e;">Loading...</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <script>
+        let stocksChart = null;
+        let capitalChart = null;
+
+        const COLORS = [
+            '#58a6ff', '#3fb950', '#f0883e', '#a371f7', '#f85149',
+            '#56d4dd', '#db61a2', '#7ee787', '#ffa657', '#ff7b72',
+            '#79c0ff', '#d2a8ff', '#ffc658', '#6cb6ff', '#b392f0',
+            '#9ecbff', '#c9d1d9', '#8b949e', '#238636', '#da3633',
+            '#1f6feb', '#bf8700', '#0d419d', '#8957e5', '#ec6547'
+        ];
+
+        async function loadData() {
+            try {
+                const res = await fetch('/api/stocks');
+                const data = await res.json();
+
+                if (!data.stocks || data.stocks.length === 0) {
+                    return;
+                }
+
+                // Aggregate by sector
+                const sectorData = {};
+                let totalInvested = 0;
+                let totalPositions = 0;
+
+                data.stocks.forEach(stock => {
+                    const sector = stock.category || 'UNCATEGORIZED';
+                    if (!sectorData[sector]) {
+                        sectorData[sector] = {
+                            count: 0,
+                            invested: 0,
+                            positions: 0,
+                            stocks: []
+                        };
+                    }
+                    sectorData[sector].count++;
+                    sectorData[sector].stocks.push(stock.symbol);
+
+                    // Calculate invested capital (position * price)
+                    const invested = (stock.position || 0) * (stock.price || 0);
+                    sectorData[sector].invested += invested;
+                    totalInvested += invested;
+
+                    if (stock.position > 0) {
+                        sectorData[sector].positions++;
+                        totalPositions++;
+                    }
+                });
+
+                // Update summary stats
+                document.getElementById('total-stocks').textContent = data.stocks.length;
+                document.getElementById('total-sectors').textContent = Object.keys(sectorData).length;
+                document.getElementById('total-invested').textContent = '$' + formatNumber(totalInvested);
+                document.getElementById('total-positions').textContent = totalPositions;
+
+                // Sort sectors by count
+                const sortedSectors = Object.entries(sectorData)
+                    .sort((a, b) => b[1].count - a[1].count);
+
+                // Create charts
+                createStocksChart(sortedSectors);
+                createCapitalChart(sortedSectors);
+                createTable(sortedSectors, data.stocks.length);
+
+            } catch (e) {
+                console.error('Error loading data:', e);
+            }
+        }
+
+        function createStocksChart(sectors) {
+            const ctx = document.getElementById('stocks-chart').getContext('2d');
+
+            if (stocksChart) stocksChart.destroy();
+
+            stocksChart = new Chart(ctx, {
+                type: 'pie',
+                data: {
+                    labels: sectors.map(([name]) => formatSectorName(name)),
+                    datasets: [{
+                        data: sectors.map(([, data]) => data.count),
+                        backgroundColor: COLORS.slice(0, sectors.length),
+                        borderColor: '#0d1117',
+                        borderWidth: 2
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'right',
+                            labels: {
+                                color: '#c9d1d9',
+                                padding: 8,
+                                font: { size: 10 },
+                                boxWidth: 12
+                            }
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: (ctx) => {
+                                    const total = ctx.dataset.data.reduce((a, b) => a + b, 0);
+                                    const pct = ((ctx.raw / total) * 100).toFixed(1);
+                                    return `${ctx.raw} stocks (${pct}%)`;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function createCapitalChart(sectors) {
+            const ctx = document.getElementById('capital-chart').getContext('2d');
+
+            if (capitalChart) capitalChart.destroy();
+
+            // Filter out sectors with no invested capital
+            const sectorsWithCapital = sectors.filter(([, data]) => data.invested > 0);
+
+            if (sectorsWithCapital.length === 0) {
+                // Show message if no positions
+                ctx.font = '14px sans-serif';
+                ctx.fillStyle = '#8b949e';
+                ctx.textAlign = 'center';
+                ctx.fillText('No open positions', ctx.canvas.width / 2, ctx.canvas.height / 2);
+                return;
+            }
+
+            capitalChart = new Chart(ctx, {
+                type: 'pie',
+                data: {
+                    labels: sectorsWithCapital.map(([name]) => formatSectorName(name)),
+                    datasets: [{
+                        data: sectorsWithCapital.map(([, data]) => data.invested),
+                        backgroundColor: COLORS.slice(0, sectorsWithCapital.length),
+                        borderColor: '#0d1117',
+                        borderWidth: 2
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'right',
+                            labels: {
+                                color: '#c9d1d9',
+                                padding: 8,
+                                font: { size: 10 },
+                                boxWidth: 12
+                            }
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: (ctx) => {
+                                    const total = ctx.dataset.data.reduce((a, b) => a + b, 0);
+                                    const pct = ((ctx.raw / total) * 100).toFixed(1);
+                                    return `$${formatNumber(ctx.raw)} (${pct}%)`;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function createTable(sectors, totalStocks) {
+            const tbody = document.getElementById('sector-body');
+            const maxCount = Math.max(...sectors.map(([, d]) => d.count));
+
+            tbody.innerHTML = sectors.map(([name, data], idx) => {
+                const pct = ((data.count / totalStocks) * 100).toFixed(1);
+                const barWidth = (data.count / maxCount) * 100;
+
+                return `
+                    <tr>
+                        <td>
+                            <span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${COLORS[idx % COLORS.length]};margin-right:8px;"></span>
+                            <span class="sector-name">${formatSectorName(name)}</span>
+                        </td>
+                        <td>${data.count} <span style="color:#8b949e;">(${pct}%)</span></td>
+                        <td style="width:200px;">
+                            <div class="sector-bar" style="width:${barWidth}%;background:${COLORS[idx % COLORS.length]};"></div>
+                        </td>
+                        <td>${data.invested > 0 ? '$' + formatNumber(data.invested) : '<span style="color:#8b949e;">--</span>'}</td>
+                        <td>${data.positions > 0 ? '<span style="color:#3fb950;">' + data.positions + '</span>' : '<span style="color:#8b949e;">0</span>'}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function formatSectorName(name) {
+            return name.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+        }
+
+        function formatNumber(n) {
+            if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
+            if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+            return n.toFixed(0);
+        }
+
+        // Load data on page load
+        loadData();
+
+        // Refresh every 30 seconds
+        setInterval(loadData, 30000);
+    </script>
+</body>
+</html>
+"""
+
 
 def read_state_file():
     """Read state from JSON file (written by bot process)"""
@@ -699,6 +1444,11 @@ def read_state_file():
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard():
     return DASHBOARD_HTML
+
+
+@app.get("/sectors", response_class=HTMLResponse)
+async def get_sectors():
+    return SECTORS_HTML
 
 
 @app.websocket("/ws")
@@ -726,27 +1476,76 @@ async def health_check():
     return {"status": "healthy", "timestamp": bot_state.last_update}
 
 
+@app.get("/api/trading/status")
+async def get_trading_status():
+    """Get current trading control status"""
+    return trading_control.get_state()
+
+
+@app.post("/api/trading/toggle")
+async def toggle_trading():
+    """Toggle trading enabled/disabled"""
+    new_state = trading_control.toggle(by="dashboard")
+    return {"enabled": new_state, "message": f"Trading {'enabled' if new_state else 'disabled'}"}
+
+
 @app.get("/api/stock/{symbol}/history")
 async def get_stock_history(symbol: str, period: str = "1mo", interval: str = "1d"):
     """Get historical OHLCV data with pre-calculated MAs for charting"""
     history = yf_client.get_history(symbol.upper(), period=period, interval=interval)
 
-    # Calculate MAs
+    # Calculate MAs and Algo Trading Signals
     closes = [bar['close'] for bar in history]
+    buy_signals = []
+    sell_signals = []
+
     for i, bar in enumerate(history):
         bar['date'] = bar['date'].isoformat() if hasattr(bar['date'], 'isoformat') else str(bar['date'])
-        # Calculate MA10
-        if i >= 9:
-            bar['ma10'] = sum(closes[i-9:i+1]) / 10
+        # Calculate MA8 (short-term)
+        if i >= 7:
+            bar['ma8'] = sum(closes[i-7:i+1]) / 8
         else:
-            bar['ma10'] = None
-        # Calculate MA30
-        if i >= 29:
-            bar['ma30'] = sum(closes[i-29:i+1]) / 30
+            bar['ma8'] = None
+        # Calculate MA21 (long-term)
+        if i >= 20:
+            bar['ma21'] = sum(closes[i-20:i+1]) / 21
         else:
-            bar['ma30'] = None
+            bar['ma21'] = None
 
-    return {"symbol": symbol.upper(), "period": period, "interval": interval, "data": history}
+        # Calculate algo trading signals (MA crossover with 0.8% threshold)
+        if i >= 20 and i > 0:  # Need MA21 and previous bar
+            prev_bar = history[i-1]
+            if prev_bar.get('ma8') and prev_bar.get('ma21') and bar['ma8'] and bar['ma21']:
+                threshold = 0.008  # 0.8% threshold matching AGGRESSIVE strategy
+
+                # BUY signal: MA8 crosses above MA21 * 1.008
+                if (prev_bar['ma8'] <= prev_bar['ma21'] * (1 + threshold) and
+                    bar['ma8'] > bar['ma21'] * (1 + threshold)):
+                    buy_signals.append({
+                        'date': bar['date'],
+                        'price': bar['close'],
+                        'index': i
+                    })
+
+                # SELL signal: MA8 crosses below MA21 * 0.992
+                elif (prev_bar['ma8'] >= prev_bar['ma21'] * (1 - threshold) and
+                      bar['ma8'] < bar['ma21'] * (1 - threshold)):
+                    sell_signals.append({
+                        'date': bar['date'],
+                        'price': bar['close'],
+                        'index': i
+                    })
+
+    return {
+        "symbol": symbol.upper(),
+        "period": period,
+        "interval": interval,
+        "data": history,
+        "algo_signals": {
+            "buy": buy_signals,
+            "sell": sell_signals
+        }
+    }
 
 
 @app.get("/api/stock/{symbol}/info")

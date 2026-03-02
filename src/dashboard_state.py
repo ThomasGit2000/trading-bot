@@ -42,6 +42,13 @@ class BotState:
     multi_stock: bool = False
     stocks: List[Dict[str, Any]] = field(default_factory=list)
 
+    # Market state
+    market_open: bool = False
+    regime_aware: bool = False
+    regime: Optional[Dict[str, Any]] = None
+    trading: Optional[Dict[str, Any]] = None
+    trading_control: Optional[Dict[str, Any]] = None
+
     # Lock for thread safety
     _lock: Lock = field(default_factory=Lock, repr=False)
 
@@ -62,7 +69,12 @@ class BotState:
                     "stocks": self.stocks,
                     "is_connected": self.is_connected,
                     "dry_run": self.dry_run,
-                    "last_update": self.last_update.isoformat() if self.last_update else None
+                    "last_update": self.last_update.isoformat() if self.last_update else None,
+                    "market_open": self.market_open,
+                    "regime_aware": self.regime_aware,
+                    "regime": self.regime,
+                    "trading": self.trading,
+                    "trading_control": self.trading_control
                 }
             else:
                 return self.to_dict()
