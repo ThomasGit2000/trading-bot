@@ -12,8 +12,18 @@ import json
 from src.dashboard_state import bot_state
 from src.yfinance_client import YFinanceClient
 from src.trading_control import trading_control
+from src.alpha_vantage import AlphaVantageClient
 
 yf_client = YFinanceClient()
+
+# Initialize Alpha Vantage client for news
+try:
+    av_client = AlphaVantageClient()
+    av_news_available = True
+except Exception as e:
+    av_client = None
+    av_news_available = False
+    print(f"Alpha Vantage news not available: {e}")
 
 app = FastAPI(title="Multi-Stock Trading Dashboard")
 
@@ -39,7 +49,7 @@ DASHBOARD_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Master Board</title>
+    <title>Master Board - MA(8/21) Pure Momentum | No RSI Filter</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -240,26 +250,42 @@ DASHBOARD_HTML = """
 </head>
 <body>
     <div class="header">
-        <div style="display: flex; align-items: center; gap: 12px;">
-            <h1>Master Board - AGGRESSIVE MA(8/21)</h1>
-            <a href="/sectors" class="nav-btn">Sectors</a>
+        <div style="display: flex; flex-direction: column; gap: 2px;">
+            <h1 style="font-size: 20px;">Master Board</h1>
+            <span style="font-size: 14px; color: #8b949e;">MA(8/21) Pure Momentum | No Filters | 0.8% Threshold</span>
         </div>
-        <div style="display: flex; gap: 8px; align-items: center;">
-            <span id="net-liq" class="status-badge" style="background:#1f6feb;font-weight:700;" title="Net Liquidation Value">
-                Net: -- DKK
-            </span>
-            <span id="excess-liq" class="status-badge" style="background:#238636;font-weight:700;" title="Excess Liquidity / Available Cash">
-                Cash: -- DKK
-            </span>
-            <button id="master-trading-btn" class="master-btn trading-stopped" onclick="toggleTrading()" title="Click to toggle trading">
-                TRADING STOPPED
-            </button>
-            <span id="market-status" class="status-badge" style="background:#6e7681;">MKT: --</span>
-            <span id="trade-stats" class="status-badge" style="background:#30363d;font-size:10px;" title="Verified/Pending/Failed trades">
-                Trades: <span id="trades-filled" style="color:#3fb950;">0</span>/<span id="trades-pending" style="color:#f0883e;">0</span>/<span id="trades-failed" style="color:#f85149;">0</span>
-            </span>
-            <span id="connection-status" class="status-badge status-disconnected" title="WebSocket Connection">WS: ...</span>
-            <span id="trading-mode" class="status-badge status-dry" title="Trading Mode">MODE: DRY</span>
+        <div style="display: flex; gap: 8px; align-items: flex-end;">
+            <div style="display:flex;gap:4px;align-items:flex-end;height:100%;">
+                <span id="net-liq" class="status-badge" style="background:#1f6feb;font-weight:700;font-size:12px;" title="Net Liquidation Value">
+                    Net: -- DKK
+                </span>
+                <span id="excess-liq" class="status-badge" style="background:#238636;font-weight:700;font-size:12px;" title="Excess Liquidity / Available Cash">
+                    Cash: -- DKK
+                </span>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:4px;align-items:stretch;">
+                <a href="/market-hours" class="nav-btn" style="text-align:center;padding:3px 8px;font-size:12px;">MKT Hours</a>
+                <div style="display:flex;gap:4px;">
+                    <span id="market-pre" class="status-badge" style="background:#da3633;font-size:12px;padding:3px 8px;cursor:help;" title="Pre-market: Closed">PRE</span>
+                    <span id="market-regular" class="status-badge" style="background:#da3633;font-size:12px;padding:3px 8px;cursor:help;" title="Regular market: Closed">MKT</span>
+                    <span id="market-after" class="status-badge" style="background:#da3633;font-size:12px;padding:3px 8px;cursor:help;" title="After-hours: Closed">AFTER</span>
+                </div>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:4px;align-items:stretch;">
+                <a href="/sectors" class="nav-btn" style="text-align:center;padding:3px 8px;font-size:12px;width:100%;">Sectors</a>
+                <span id="trade-stats" class="status-badge" style="background:#30363d;font-size:12px;" title="Verified/Pending/Failed trades">
+                    Trades: <span id="trades-filled" style="color:#3fb950;">0</span>/<span id="trades-pending" style="color:#f0883e;">0</span>/<span id="trades-failed" style="color:#f85149;">0</span>
+                </span>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:4px;align-items:stretch;">
+                <button id="master-trading-btn" class="master-btn trading-stopped" onclick="toggleTrading()" title="Click to toggle trading" style="width:100%;padding:4px 8px;font-size:12px;">
+                    TRADING STOPPED
+                </button>
+                <div style="display:flex;gap:4px;">
+                    <span id="connection-status" class="status-badge status-disconnected" style="font-size:12px;" title="WebSocket Connection">WS: ...</span>
+                    <span id="trading-mode" class="status-badge status-dry" style="font-size:12px;" title="Trading Mode">MODE: DRY</span>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -271,18 +297,19 @@ DASHBOARD_HTML = """
                 <th class="sortable" data-sort="category" onclick="sortTable('category')">Category <span class="sort-arrow"></span></th>
                 <th class="sortable" data-sort="days_to_event" onclick="sortTable('days_to_event')">Event <span class="sort-arrow"></span></th>
                 <th class="sortable" data-sort="price" onclick="sortTable('price')">Price <span class="sort-arrow"></span></th>
-                <th>24H</th>
+                <th>Trend</th>
                 <th class="sortable" data-sort="position" onclick="sortTable('position')">Pos <span class="sort-arrow"></span></th>
                 <th class="sortable" data-sort="position_size" onclick="sortTable('position_size')">Target <span class="sort-arrow"></span></th>
                 <th class="sortable" data-sort="prices_collected" onclick="sortTable('prices_collected')">Data <span class="sort-arrow"></span></th>
                 <th class="sortable" data-sort="signal" onclick="sortTable('signal')">Signal <span class="sort-arrow"></span></th>
                 <th class="sortable" data-sort="short_ma" onclick="sortTable('short_ma')">MA(8) <span class="sort-arrow"></span></th>
                 <th class="sortable" data-sort="long_ma" onclick="sortTable('long_ma')">MA(21) <span class="sort-arrow"></span></th>
-                <th class="sortable" data-sort="signal_strength" onclick="sortTable('signal_strength')">News <span class="sort-arrow"></span></th>
+                <th class="sortable" data-sort="rsi" onclick="sortTable('rsi')">RSI <span class="sort-arrow"></span></th>
+                <th class="sortable" data-sort="signal_strength" onclick="sortTable('signal_strength')">Sentiment <span class="sort-arrow"></span></th>
             </tr>
         </thead>
         <tbody id="stocks-body">
-            <tr><td colspan="13" style="text-align:center;color:#8b949e;">Loading...</td></tr>
+            <tr><td colspan="14" style="text-align:center;color:#8b949e;">Loading...</td></tr>
         </tbody>
     </table>
 
@@ -325,7 +352,13 @@ DASHBOARD_HTML = """
     <div id="stock-modal" class="modal-overlay" onclick="if(event.target===this)closeModal()">
         <div class="modal">
             <div class="modal-header">
-                <h2 id="modal-title">TSLA - Tesla Inc</h2>
+                <h2 style="display:flex;align-items:center;gap:12px;">
+                    <div id="modal-logo" style="width:40px;height:40px;border-radius:6px;background:#21262d;display:flex;align-items:center;justify-content:center;overflow:hidden;flex-shrink:0;">
+                        <img src="" alt="" style="width:36px;height:36px;object-fit:contain;" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
+                        <div style="display:none;width:40px;height:40px;border-radius:6px;background:#1f6feb;align-items:center;justify-content:center;font-weight:700;font-size:16px;color:white;position:absolute;">T</div>
+                    </div>
+                    <span id="modal-title">TSLA - Tesla Inc</span>
+                </h2>
                 <button class="modal-close" onclick="closeModal()">&times;</button>
             </div>
             <div class="modal-body">
@@ -431,6 +464,79 @@ DASHBOARD_HTML = """
             };
         }
 
+        function updateMarketStatus() {
+            // Get current time in ET (US/Eastern)
+            const now = new Date();
+            const etTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+            const hours = etTime.getHours();
+            const minutes = etTime.getMinutes();
+            const currentMinutes = hours * 60 + minutes;
+
+            // Market hours in ET (minutes from midnight)
+            const preMarketStart = 4 * 60;       // 4:00 AM
+            const preMarketEnd = 9 * 60 + 30;    // 9:30 AM
+            const regularMarketStart = 9 * 60 + 30;   // 9:30 AM
+            const regularMarketEnd = 16 * 60;    // 4:00 PM
+            const afterHoursStart = 16 * 60;     // 4:00 PM
+            const afterHoursEnd = 20 * 60;       // 8:00 PM
+
+            // Check if it's a weekend
+            const dayOfWeek = etTime.getDay();
+            const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
+
+            const preEl = document.getElementById('market-pre');
+            const regEl = document.getElementById('market-regular');
+            const aftEl = document.getElementById('market-after');
+
+            // Safety check - elements might not exist yet
+            if (!preEl || !regEl || !aftEl) return;
+
+            if (isWeekend) {
+                // All closed on weekends
+                preEl.style.background = '#da3633';
+                regEl.style.background = '#da3633';
+                aftEl.style.background = '#da3633';
+                preEl.title = 'Pre-market: Closed (Weekend)';
+                regEl.title = 'Regular market: Closed (Weekend)';
+                aftEl.title = 'After-hours: Closed (Weekend)';
+            } else {
+                // Pre-market
+                if (currentMinutes >= preMarketStart && currentMinutes < preMarketEnd) {
+                    preEl.style.background = '#238636';
+                    preEl.title = 'Pre-market: OPEN';
+                } else {
+                    preEl.style.background = '#da3633';
+                    preEl.title = 'Pre-market: Closed';
+                }
+
+                // Regular market
+                if (currentMinutes >= regularMarketStart && currentMinutes < regularMarketEnd) {
+                    regEl.style.background = '#238636';
+                    regEl.title = 'Regular market: OPEN';
+                } else {
+                    regEl.style.background = '#da3633';
+                    regEl.title = 'Regular market: Closed';
+                }
+
+                // After-hours
+                if (currentMinutes >= afterHoursStart && currentMinutes < afterHoursEnd) {
+                    aftEl.style.background = '#238636';
+                    aftEl.title = 'After-hours: OPEN';
+                } else {
+                    aftEl.style.background = '#da3633';
+                    aftEl.title = 'After-hours: Closed';
+                }
+
+                // Check if all closed
+                const allClosed = currentMinutes < preMarketStart || currentMinutes >= afterHoursEnd;
+                if (allClosed) {
+                    preEl.title = 'All markets closed';
+                    regEl.title = 'All markets closed';
+                    aftEl.title = 'All markets closed';
+                }
+            }
+        }
+
         function updateDashboard(data) {
             const mode = document.getElementById('trading-mode');
             mode.textContent = data.dry_run ? 'MODE: DRY' : 'MODE: LIVE';
@@ -438,10 +544,10 @@ DASHBOARD_HTML = """
 
             // Update liquidity displays
             if (data.net_liquidation_dkk !== undefined) {
-                document.getElementById('net-liq').textContent = `Net: ${data.net_liquidation_dkk.toLocaleString()} DKK`;
+                document.getElementById('net-liq').textContent = `Net: ${Math.round(data.net_liquidation_dkk).toLocaleString()} DKK`;
             }
             if (data.excess_liquidity_dkk !== undefined) {
-                document.getElementById('excess-liq').textContent = `Cash: ${data.excess_liquidity_dkk.toLocaleString()} DKK`;
+                document.getElementById('excess-liq').textContent = `Cash: ${Math.round(data.excess_liquidity_dkk).toLocaleString()} DKK`;
             }
 
             // Master trading control
@@ -452,29 +558,8 @@ DASHBOARD_HTML = """
                 masterBtn.className = 'master-btn ' + (enabled ? 'trading-live' : 'trading-stopped');
             }
 
-            // Market status (with debounce to prevent flickering)
-            const mktStatus = document.getElementById('market-status');
-            const newMarketState = data.market_open ? 'OPEN' : 'CLOSED';
-            if (!window.lastMarketState) window.lastMarketState = newMarketState;
-            if (!window.marketStateCount) window.marketStateCount = 0;
-
-            // Only change if we get 3 consecutive same values
-            if (newMarketState === window.lastMarketState) {
-                window.marketStateCount++;
-            } else {
-                window.marketStateCount = 1;
-                window.lastMarketState = newMarketState;
-            }
-
-            if (window.marketStateCount >= 3) {
-                if (newMarketState === 'OPEN') {
-                    mktStatus.textContent = 'MKT: OPEN';
-                    mktStatus.style.background = '#238636';
-                } else {
-                    mktStatus.textContent = 'MKT: CLOSED';
-                    mktStatus.style.background = '#6e7681';
-                }
-            }
+            // Market status - three sessions (Pre, Regular, After)
+            updateMarketStatus();
 
             // Trading stats
             if (data.trading && data.trading.stats) {
@@ -629,6 +714,47 @@ DASHBOARD_HTML = """
             }).join('');
         }
 
+        function getCompanyName(symbol) {
+            const companyNames = {
+                "AAPL": "Apple Inc.", "MSFT": "Microsoft Corp.", "GOOGL": "Alphabet Inc.", "META": "Meta Platforms",
+                "NVDA": "NVIDIA Corp.", "AMD": "Advanced Micro Devices", "AVGO": "Broadcom Inc.", "QCOM": "Qualcomm Inc.",
+                "TSM": "Taiwan Semiconductor", "ASML": "ASML Holding", "MU": "Micron Technology", "ARM": "Arm Holdings",
+                "PLTR": "Palantir Technologies", "AI": "C3.ai Inc.", "SNOW": "Snowflake Inc.", "DDOG": "Datadog Inc.",
+                "CRM": "Salesforce Inc.", "NOW": "ServiceNow Inc.", "NET": "Cloudflare Inc.", "PANW": "Palo Alto Networks",
+                "V": "Visa Inc.", "MA": "Mastercard Inc.", "XYZ": "Excelerate Energy", "COIN": "Coinbase Global",
+                "PYPL": "PayPal Holdings", "TSLA": "Tesla Inc.", "MARA": "Marathon Digital", "MSTR": "MicroStrategy Inc.",
+                "CRWD": "CrowdStrike Holdings", "ZS": "Zscaler Inc.", "LLY": "Eli Lilly and Co.", "UNH": "UnitedHealth Group",
+                "ABBV": "AbbVie Inc.", "ISRG": "Intuitive Surgical", "DHR": "Danaher Corp.", "AMZN": "Amazon.com Inc.",
+                "COST": "Costco Wholesale", "HD": "Home Depot Inc.", "MCD": "McDonald's Corp.", "CMG": "Chipotle Mexican Grill",
+                "SBUX": "Starbucks Corp.", "BKNG": "Booking Holdings", "NFLX": "Netflix Inc.", "DIS": "Walt Disney Co.",
+                "SPOT": "Spotify Technology", "DHI": "D.R. Horton Inc.", "JPM": "JPMorgan Chase", "GS": "Goldman Sachs",
+                "BLK": "BlackRock Inc.", "GE": "General Electric", "CAT": "Caterpillar Inc.", "HON": "Honeywell International",
+                "RTX": "RTX Corp.", "LMT": "Lockheed Martin", "BA": "Boeing Co.", "UPS": "United Parcel Service",
+                "PGR": "Progressive Corp.", "NEE": "NextEra Energy", "CEG": "Constellation Energy", "PLD": "Prologis Inc.",
+                "AMT": "American Tower", "LIN": "Linde PLC", "FCX": "Freeport-McMoRan", "XOM": "Exxon Mobil",
+                "CVX": "Chevron Corp.", "ENPH": "Enphase Energy", "BABA": "Alibaba Group", "TMUS": "T-Mobile US",
+                "ORLY": "O'Reilly Automotive", "RIOT": "Riot Platforms"
+            };
+            return companyNames[symbol] || symbol;
+        }
+
+        function getLogoColor(symbol) {
+            // Generate consistent color for each ticker based on hash
+            let hash = 0;
+            for (let i = 0; i < symbol.length; i++) {
+                hash = symbol.charCodeAt(i) + ((hash << 5) - hash);
+            }
+
+            // Color palette with good contrast on dark background
+            const colors = [
+                '#1f6feb', '#58a6ff', '#3fb950', '#f0883e', '#f85149',
+                '#a371f7', '#d73a49', '#0969da', '#1a7f37', '#bf8700',
+                '#8250df', '#cf222e', '#0550ae', '#0a3069', '#744210'
+            ];
+
+            return colors[Math.abs(hash) % colors.length];
+        }
+
         function createRow(s, rowNum) {
             const hasPos = s.position > 0;
             const sigPos = ((s.signal_strength || 0) + 100) / 200 * 100;
@@ -647,15 +773,34 @@ DASHBOARD_HTML = """
             const isUp = change >= 0;
             const priceClass = isUp ? 'price-up' : 'price-down';
             const arrow = isUp ? '▲' : '▼';
-            const changeStr = changePct !== 0 ? `<span class="price-change-sm ${priceClass}">${arrow}${Math.abs(changePct).toFixed(2)}%</span>` : '';
+            const changeStr = changePct !== 0 ? '<span class="price-change-sm ' + priceClass + '">' + arrow + ' ' + Math.abs(changePct).toFixed(2) + '%</span>' : '';
 
             // Format category name
             const catName = (s.category || 'N/A').replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
 
+            // Generate logo URL and fallback
+            const logoUrl = `https://assets.parqet.com/logos/symbol/${s.symbol}`;
+            const logoColor = getLogoColor(s.symbol);
+            const logoLetter = s.symbol.charAt(0);
+            const companyName = getCompanyName(s.symbol);
+
             return `
                 <tr class="${hasPos ? 'has-position' : ''}" onclick="openModal('${s.symbol}', ${JSON.stringify(s).replace(/"/g, '&quot;')})">
                     <td style="text-align:center;color:#8b949e;font-size:11px;">${rowNum}</td>
-                    <td><span class="symbol">${s.symbol}</span></td>
+                    <td>
+                        <div style="display:flex;align-items:center;gap:8px;">
+                            <div style="width:32px;height:32px;border-radius:6px;background:#21262d;display:flex;align-items:center;justify-content:center;overflow:hidden;flex-shrink:0;">
+                                <img src="${logoUrl}" alt="${s.symbol}"
+                                     style="width:28px;height:28px;object-fit:contain;"
+                                     onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
+                                <div style="display:none;width:32px;height:32px;border-radius:6px;background:${logoColor};align-items:center;justify-content:center;font-weight:700;font-size:14px;color:white;position:absolute;">${logoLetter}</div>
+                            </div>
+                            <div style="display:flex;flex-direction:column;">
+                                <span class="symbol">${s.symbol}</span>
+                                <span style="font-size:10px;color:#8b949e;">${companyName}</span>
+                            </div>
+                        </div>
+                    </td>
                     <td class="category-cell">${catName}</td>
                     <td>${formatEventDays(s.upcoming_events)}</td>
                     <td class="price ${priceClass}">$${s.price?.toFixed(2) || '--'}${changeStr}</td>
@@ -669,6 +814,7 @@ DASHBOARD_HTML = """
                     </td>
                     <td class="ma-val ma-short">$${s.short_ma?.toFixed(2) || '--'}</td>
                     <td class="ma-val ma-long">$${s.long_ma?.toFixed(2) || '--'}</td>
+                    <td class="ma-val" style="color:${(s.rsi || 50) > 70 ? '#f85149' : (s.rsi || 50) < 30 ? '#3fb950' : '#8b949e'};">${s.rsi?.toFixed(1) || '50.0'}</td>
                     <td>
                         <div class="news-bar"><div class="news-indicator" style="left:${newsPos}%"></div></div>
                     </td>
@@ -732,16 +878,14 @@ DASHBOARD_HTML = """
             const points = data.map((p, i) => {
                 const x = (i / (data.length - 1)) * width;
                 const y = height - ((p - min) / range) * height;
-                return `${x},${y}`;
+                return x + ',' + y;
             }).join(' ');
 
             // Determine color: green if up, red if down
             const isUp = data[data.length - 1] >= data[0];
             const color = isUp ? '#3fb950' : '#f85149';
 
-            return `<svg width="${width}" height="${height}" style="vertical-align:middle;">
-                <polyline points="${points}" fill="none" stroke="${color}" stroke-width="1.5"/>
-            </svg>`;
+            return '<svg width="' + width + '" height="' + height + '" style="vertical-align:middle;"><polyline points="' + points + '" fill="none" stroke="' + color + '" stroke-width="1.5"/></svg>';
         }
 
         function getNewsSentiment(news) {
@@ -778,6 +922,24 @@ DASHBOARD_HTML = """
 
             document.getElementById('stock-modal').classList.add('active');
             document.getElementById('modal-title').textContent = symbol + ' - Loading...';
+
+            // Set logo
+            const modalLogoDiv = document.getElementById('modal-logo');
+            const logoUrl = `https://assets.parqet.com/logos/symbol/${symbol}`;
+            const logoColor = getLogoColor(symbol);
+            const logoLetter = symbol.charAt(0);
+            const imgEl = modalLogoDiv.querySelector('img');
+            const fallbackEl = modalLogoDiv.querySelector('div');
+
+            // Reset visibility - show img, hide fallback
+            imgEl.style.display = '';
+            fallbackEl.style.display = 'none';
+
+            // Set logo properties
+            imgEl.src = logoUrl;
+            imgEl.alt = symbol;
+            fallbackEl.textContent = logoLetter;
+            fallbackEl.style.background = logoColor;
 
             // Update with initial data
             updateModalRealtime(stockData);
@@ -893,15 +1055,87 @@ DASHBOARD_HTML = """
                     return;
                 }
 
-                newsEl.innerHTML = data.news.map(n => `
-                    <div class="news-item">
-                        <div class="news-title">${n.link ? '<a href="' + n.link + '" target="_blank" style="color:inherit;text-decoration:none;">' + n.title + '</a>' : n.title}</div>
-                        <div class="news-meta">
-                            ${n.source} ${n.time_ago ? '• ' + n.time_ago : ''}
-                            <span class="news-sentiment ${n.sentiment}">${n.sentiment}</span>
+                // Clear previous content
+                newsEl.innerHTML = '';
+
+                // Display overall sentiment if available
+                if (data.overall_sentiment !== undefined) {
+                    const overallScore = data.overall_sentiment;
+                    let overallColor = '#8b949e';
+                    let overallBg = 'rgba(139,148,158,0.15)';
+                    let overallLabel = 'Neutral';
+
+                    if (overallScore >= 0.15) {
+                        overallColor = '#3fb950';
+                        overallBg = 'rgba(63,185,80,0.15)';
+                        overallLabel = 'Positive';
+                    } else if (overallScore <= -0.15) {
+                        overallColor = '#f85149';
+                        overallBg = 'rgba(248,81,73,0.15)';
+                        overallLabel = 'Negative';
+                    }
+
+                    const overallDiv = document.createElement('div');
+                    overallDiv.style.cssText = `background:${overallBg};border-left:4px solid ${overallColor};padding:12px;margin-bottom:16px;border-radius:4px;`;
+                    overallDiv.innerHTML = `
+                        <div style="display:flex;justify-content:space-between;align-items:center;">
+                            <div>
+                                <div style="font-size:11px;color:#8b949e;margin-bottom:4px;">Overall News Sentiment (${data.article_count} articles)</div>
+                                <div style="font-size:18px;font-weight:600;color:${overallColor};">${overallLabel}</div>
+                            </div>
+                            <div style="font-size:24px;font-weight:700;color:${overallColor};">${(overallScore * 100).toFixed(0)}</div>
                         </div>
-                    </div>
-                `).join('');
+                    `;
+                    newsEl.appendChild(overallDiv);
+                }
+
+                // Display source info
+                const sourceInfo = document.createElement('div');
+                sourceInfo.style.cssText = 'color:#8b949e;font-size:11px;margin-bottom:12px;';
+                sourceInfo.textContent = data.source || 'News Feed';
+                newsEl.appendChild(sourceInfo);
+
+                // Display news articles
+                const newsHtml = data.news.map(n => {
+                    // Sentiment color based on score
+                    let sentimentColor = '#8b949e';  // neutral gray
+                    let sentimentBg = 'rgba(139,148,158,0.1)';
+                    if (n.sentiment_score !== undefined) {
+                        if (n.sentiment_score >= 0.15) {
+                            sentimentColor = '#3fb950';  // positive green
+                            sentimentBg = 'rgba(63,185,80,0.15)';
+                        } else if (n.sentiment_score <= -0.15) {
+                            sentimentColor = '#f85149';  // negative red
+                            sentimentBg = 'rgba(248,81,73,0.15)';
+                        }
+                    }
+
+                    // Format sentiment score
+                    const scoreDisplay = n.sentiment_score !== undefined
+                        ? `<span style="font-weight:600;color:${sentimentColor};">${(n.sentiment_score * 100).toFixed(0)}</span>`
+                        : '';
+
+                    // Relevance indicator
+                    const relevanceDisplay = n.relevance !== undefined
+                        ? `<span style="color:#8b949e;font-size:10px;">• Relevance: ${(n.relevance * 100).toFixed(0)}%</span>`
+                        : '';
+
+                    return `
+                        <div class="news-item" style="border-left:3px solid ${sentimentColor};padding-left:8px;margin-bottom:10px;">
+                            <div class="news-title">${n.link ? '<a href="' + n.link + '" target="_blank" style="color:inherit;text-decoration:none;">' + n.title + '</a>' : n.title}</div>
+                            <div class="news-meta" style="display:flex;align-items:center;gap:8px;margin-top:4px;">
+                                <span style="color:#8b949e;">${n.source} ${n.time_ago ? '• ' + n.time_ago : ''}</span>
+                                ${scoreDisplay ? `<span style="background:${sentimentBg};padding:2px 6px;border-radius:3px;font-size:11px;">
+                                    Sentiment: ${scoreDisplay}
+                                </span>` : ''}
+                                ${relevanceDisplay}
+                            </div>
+                            ${n.summary ? '<div style="color:#8b949e;font-size:11px;margin-top:4px;line-height:1.4;">' + n.summary.substring(0, 150) + '...</div>' : ''}
+                        </div>
+                    `;
+                }).join('');
+
+                newsEl.innerHTML += newsHtml;
             } catch (e) {
                 console.error('Error loading news:', e);
                 document.getElementById('modal-news').innerHTML = '<div style="color:#8b949e;">Error loading news</div>';
@@ -1160,7 +1394,10 @@ SECTORS_HTML = """
 <body>
     <div class="header">
         <h1>Sector Analysis</h1>
-        <a href="/" class="nav-btn">← Back to Dashboard</a>
+        <div style="display: flex; gap: 8px;">
+            <a href="/" class="nav-btn">← Dashboard</a>
+            <a href="/market-hours" class="nav-btn">MKT Hours</a>
+        </div>
     </div>
 
     <div class="summary-stats">
@@ -1428,6 +1665,527 @@ SECTORS_HTML = """
 </html>
 """
 
+MARKET_HOURS_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Market Hours - Trading Clock</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+            background: #0d1117; color: #c9d1d9; padding: 20px;
+            font-size: 13px;
+        }
+        .header {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 24px; padding-bottom: 12px; border-bottom: 1px solid #30363d;
+        }
+        .header h1 { font-size: 18px; font-weight: 600; }
+        .nav-btn {
+            padding: 6px 14px; border-radius: 6px; font-size: 12px; font-weight: 600;
+            background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
+            text-decoration: none; transition: all 0.2s;
+        }
+        .nav-btn:hover { background: #30363d; border-color: #58a6ff; color: #58a6ff; }
+
+        .clock-container {
+            background: #161b22; border-radius: 8px; padding: 24px;
+            border: 1px solid #30363d; margin-bottom: 24px;
+        }
+        .clock-title {
+            font-size: 16px; font-weight: 600; margin-bottom: 20px;
+            display: flex; align-items: center; gap: 12px;
+        }
+        .current-time {
+            font-size: 24px; font-weight: 700; color: #58a6ff;
+        }
+        .timezone-label {
+            font-size: 12px; color: #8b949e; font-weight: normal;
+        }
+
+        .timeline-container {
+            overflow-x: auto; padding-bottom: 10px;
+        }
+        .timeline-wrapper {
+            min-width: 1200px;
+        }
+        .timeline-header {
+            display: flex; margin-bottom: 8px; padding-left: 120px;
+        }
+        .hour-label {
+            flex: 1; text-align: center; font-size: 11px; color: #8b949e;
+            min-width: 50px;
+        }
+        .hour-label.current { color: #58a6ff; font-weight: 700; }
+
+        .market-row {
+            display: flex; align-items: center; margin-bottom: 16px;
+        }
+        .market-name {
+            width: 120px; font-weight: 600; font-size: 13px;
+            flex-shrink: 0;
+        }
+        .market-name .flag { font-size: 16px; margin-right: 6px; }
+        .market-name .subtitle { font-size: 10px; color: #8b949e; display: block; }
+
+        .timeline-bar {
+            flex: 1; height: 32px; position: relative;
+            background: #21262d; border-radius: 4px;
+            display: flex;
+        }
+        .hour-segment {
+            flex: 1; height: 100%; position: relative;
+            border-right: 1px solid #30363d;
+        }
+        .hour-segment:last-child { border-right: none; }
+
+        .session {
+            position: absolute; height: 100%; border-radius: 3px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 10px; font-weight: 600; color: white;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+            overflow: hidden; white-space: nowrap;
+        }
+        .session-premarket { background: linear-gradient(135deg, #f0883e, #d68a00); }
+        .session-regular { background: linear-gradient(135deg, #238636, #2ea043); }
+        .session-afterhours { background: linear-gradient(135deg, #8957e5, #6e40c9); }
+        .session-closed { background: #30363d; color: #8b949e; }
+
+        .current-time-line {
+            position: absolute; top: 0; bottom: 0; width: 2px;
+            background: #f85149; z-index: 10;
+            box-shadow: 0 0 8px rgba(248, 81, 73, 0.8);
+        }
+        .current-time-dot {
+            position: absolute; top: -6px; left: -4px;
+            width: 10px; height: 10px; background: #f85149;
+            border-radius: 50%; border: 2px solid #0d1117;
+        }
+
+        .legend {
+            display: flex; gap: 24px; margin-top: 20px; flex-wrap: wrap;
+        }
+        .legend-item {
+            display: flex; align-items: center; gap: 8px; font-size: 12px;
+        }
+        .legend-color {
+            width: 16px; height: 16px; border-radius: 3px;
+        }
+        .legend-premarket { background: linear-gradient(135deg, #f0883e, #d68a00); }
+        .legend-regular { background: linear-gradient(135deg, #238636, #2ea043); }
+        .legend-afterhours { background: linear-gradient(135deg, #8957e5, #6e40c9); }
+
+        .info-cards {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px;
+        }
+        .info-card {
+            background: #161b22; border-radius: 8px; padding: 20px;
+            border: 1px solid #30363d;
+        }
+        .info-card h3 {
+            font-size: 14px; margin-bottom: 12px; display: flex;
+            align-items: center; gap: 8px;
+        }
+        .info-card .flag { font-size: 20px; }
+        .info-row {
+            display: flex; justify-content: space-between; padding: 8px 0;
+            border-bottom: 1px solid #21262d; font-size: 12px;
+        }
+        .info-row:last-child { border-bottom: none; }
+        .info-label { color: #8b949e; }
+        .info-value { font-weight: 600; }
+        .info-value.open { color: #3fb950; }
+        .info-value.closed { color: #f85149; }
+
+        .status-dot {
+            display: inline-block; width: 8px; height: 8px;
+            border-radius: 50%; margin-right: 6px;
+        }
+        .status-dot.open { background: #3fb950; box-shadow: 0 0 6px rgba(63, 185, 80, 0.6); }
+        .status-dot.closed { background: #f85149; }
+        .status-dot.premarket { background: #f0883e; box-shadow: 0 0 6px rgba(240, 136, 62, 0.6); }
+        .status-dot.afterhours { background: #8957e5; box-shadow: 0 0 6px rgba(137, 87, 229, 0.6); }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Market Hours - Trading Clock</h1>
+        <div style="display: flex; gap: 8px;">
+            <a href="/" class="nav-btn">← Dashboard</a>
+            <a href="/sectors" class="nav-btn">Sectors</a>
+        </div>
+    </div>
+
+    <div class="clock-container">
+        <div class="clock-title">
+            <span>Copenhagen Time (CET/CEST):</span>
+            <span class="current-time" id="current-time">--:--:--</span>
+            <span class="timezone-label" id="timezone-info"></span>
+        </div>
+
+        <div class="timeline-container">
+            <div class="timeline-wrapper">
+                <div class="timeline-header" id="timeline-header">
+                    <!-- Hours 0-24 generated by JS -->
+                </div>
+
+                <div class="market-row">
+                    <div class="market-name">
+                        <span class="flag">🇺🇸</span>NYSE
+                        <span class="subtitle">New York Stock Exchange</span>
+                    </div>
+                    <div class="timeline-bar" id="nyse-timeline">
+                        <!-- Sessions generated by JS -->
+                    </div>
+                </div>
+
+                <div class="market-row">
+                    <div class="market-name">
+                        <span class="flag">🇺🇸</span>NASDAQ
+                        <span class="subtitle">Same hours as NYSE</span>
+                    </div>
+                    <div class="timeline-bar" id="nasdaq-timeline">
+                        <!-- Sessions generated by JS -->
+                    </div>
+                </div>
+
+                <div class="market-row">
+                    <div class="market-name">
+                        <span class="flag">🇪🇺</span>Euronext
+                        <span class="subtitle">Paris, Amsterdam, Brussels</span>
+                    </div>
+                    <div class="timeline-bar" id="euronext-timeline">
+                        <!-- Sessions generated by JS -->
+                    </div>
+                </div>
+
+                <div class="market-row">
+                    <div class="market-name">
+                        <span class="flag">🇩🇰</span>Copenhagen
+                        <span class="subtitle">Nasdaq Copenhagen</span>
+                    </div>
+                    <div class="timeline-bar" id="copenhagen-timeline">
+                        <!-- Sessions generated by JS -->
+                    </div>
+                </div>
+
+                <div class="market-row">
+                    <div class="market-name">
+                        <span class="flag">🇬🇧</span>London
+                        <span class="subtitle">London Stock Exchange</span>
+                    </div>
+                    <div class="timeline-bar" id="london-timeline">
+                        <!-- Sessions generated by JS -->
+                    </div>
+                </div>
+
+                <div class="market-row">
+                    <div class="market-name">
+                        <span class="flag">🇩🇪</span>Frankfurt
+                        <span class="subtitle">Deutsche Börse (Xetra)</span>
+                    </div>
+                    <div class="timeline-bar" id="frankfurt-timeline">
+                        <!-- Sessions generated by JS -->
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="legend">
+            <div class="legend-item">
+                <div class="legend-color legend-premarket"></div>
+                <span>Pre-Market</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color legend-regular"></div>
+                <span>Regular Trading</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color legend-afterhours"></div>
+                <span>After-Hours</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="info-cards">
+        <div class="info-card">
+            <h3><span class="flag">🇺🇸</span>NYSE / NASDAQ</h3>
+            <div class="info-row">
+                <span class="info-label">Status</span>
+                <span class="info-value" id="nyse-status"><span class="status-dot closed"></span>Closed</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Pre-Market</span>
+                <span class="info-value">10:00 - 15:30 CET</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Regular Hours</span>
+                <span class="info-value">15:30 - 22:00 CET</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">After-Hours</span>
+                <span class="info-value">22:00 - 02:00 CET</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Local Time (ET)</span>
+                <span class="info-value" id="et-time">--:--</span>
+            </div>
+        </div>
+
+        <div class="info-card">
+            <h3><span class="flag">🇪🇺</span>Euronext / Copenhagen</h3>
+            <div class="info-row">
+                <span class="info-label">Status</span>
+                <span class="info-value" id="euronext-status"><span class="status-dot closed"></span>Closed</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Pre-Market</span>
+                <span class="info-value">07:15 - 09:00 CET</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Regular Hours</span>
+                <span class="info-value">09:00 - 17:30 CET</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Post-Market</span>
+                <span class="info-value">17:30 - 17:40 CET</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Next Open/Close</span>
+                <span class="info-value" id="euronext-next">--</span>
+            </div>
+        </div>
+
+        <div class="info-card">
+            <h3><span class="flag">🇬🇧</span>London Stock Exchange</h3>
+            <div class="info-row">
+                <span class="info-label">Status</span>
+                <span class="info-value" id="london-status"><span class="status-dot closed"></span>Closed</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Pre-Market</span>
+                <span class="info-value">08:00 - 09:00 CET</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Regular Hours</span>
+                <span class="info-value">09:00 - 17:30 CET</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Post-Market</span>
+                <span class="info-value">17:30 - 17:35 CET</span>
+            </div>
+        </div>
+
+        <div class="info-card">
+            <h3><span class="flag">🇩🇪</span>Frankfurt (Xetra)</h3>
+            <div class="info-row">
+                <span class="info-label">Status</span>
+                <span class="info-value" id="frankfurt-status"><span class="status-dot closed"></span>Closed</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Pre-Market</span>
+                <span class="info-value">08:00 - 09:00 CET</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Regular Hours</span>
+                <span class="info-value">09:00 - 17:30 CET</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Post-Market</span>
+                <span class="info-value">17:30 - 20:00 CET</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Market hours in CET (Copenhagen time) - hours as decimals (e.g., 9.5 = 9:30)
+        const markets = {
+            nyse: {
+                premarket: { start: 10, end: 15.5 },      // 4:00-9:30 ET = 10:00-15:30 CET
+                regular: { start: 15.5, end: 22 },         // 9:30-16:00 ET = 15:30-22:00 CET
+                afterhours: { start: 22, end: 26 }         // 16:00-20:00 ET = 22:00-02:00 CET (next day)
+            },
+            nasdaq: {
+                premarket: { start: 10, end: 15.5 },
+                regular: { start: 15.5, end: 22 },
+                afterhours: { start: 22, end: 26 }
+            },
+            euronext: {
+                premarket: { start: 7.25, end: 9 },        // 07:15 - 09:00 CET
+                regular: { start: 9, end: 17.5 },          // 09:00 - 17:30 CET
+                afterhours: { start: 17.5, end: 17.67 }    // 17:30 - 17:40 CET
+            },
+            copenhagen: {
+                premarket: { start: 7.25, end: 9 },
+                regular: { start: 9, end: 17.5 },
+                afterhours: { start: 17.5, end: 17.67 }
+            },
+            london: {
+                premarket: { start: 8, end: 9 },           // 07:00-08:00 GMT = 08:00-09:00 CET
+                regular: { start: 9, end: 17.5 },          // 08:00-16:30 GMT = 09:00-17:30 CET
+                afterhours: { start: 17.5, end: 17.58 }    // 16:30-16:35 GMT = 17:30-17:35 CET
+            },
+            frankfurt: {
+                premarket: { start: 8, end: 9 },
+                regular: { start: 9, end: 17.5 },
+                afterhours: { start: 17.5, end: 20 }
+            }
+        };
+
+        function buildTimeline() {
+            // Build hour labels
+            const header = document.getElementById('timeline-header');
+            header.innerHTML = '';
+            for (let h = 0; h <= 24; h++) {
+                const label = document.createElement('div');
+                label.className = 'hour-label';
+                label.textContent = h + 'H';
+                label.dataset.hour = h;
+                header.appendChild(label);
+            }
+
+            // Build each market timeline
+            Object.keys(markets).forEach(marketId => {
+                const market = markets[marketId];
+                const timeline = document.getElementById(marketId + '-timeline');
+                if (!timeline) return;
+
+                timeline.innerHTML = '';
+                timeline.style.position = 'relative';
+
+                // Create hour segments
+                for (let h = 0; h < 24; h++) {
+                    const segment = document.createElement('div');
+                    segment.className = 'hour-segment';
+                    timeline.appendChild(segment);
+                }
+
+                // Add session overlays
+                addSession(timeline, market.premarket, 'premarket', 'Pre-Market');
+                addSession(timeline, market.regular, 'regular', 'Regular');
+                addSession(timeline, market.afterhours, 'afterhours', 'After-Hours');
+            });
+        }
+
+        function addSession(timeline, session, type, label) {
+            if (!session) return;
+
+            const startPercent = (session.start / 24) * 100;
+            let endHour = session.end > 24 ? 24 : session.end;
+            const widthPercent = ((endHour - session.start) / 24) * 100;
+
+            if (widthPercent <= 0) return;
+
+            const sessionEl = document.createElement('div');
+            sessionEl.className = 'session session-' + type;
+            sessionEl.style.left = startPercent + '%';
+            sessionEl.style.width = widthPercent + '%';
+            sessionEl.textContent = label;
+            timeline.appendChild(sessionEl);
+
+            // Handle sessions that wrap past midnight
+            if (session.end > 24) {
+                const wrapSession = document.createElement('div');
+                wrapSession.className = 'session session-' + type;
+                wrapSession.style.left = '0%';
+                wrapSession.style.width = ((session.end - 24) / 24 * 100) + '%';
+                wrapSession.textContent = label;
+                timeline.appendChild(wrapSession);
+            }
+        }
+
+        function updateCurrentTime() {
+            const now = new Date();
+
+            // Get Copenhagen time
+            const cetOptions = { timeZone: 'Europe/Copenhagen', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false };
+            const cetTime = now.toLocaleTimeString('en-GB', cetOptions);
+            document.getElementById('current-time').textContent = cetTime;
+
+            // Get timezone info
+            const tzName = now.toLocaleTimeString('en-GB', { timeZone: 'Europe/Copenhagen', timeZoneName: 'short' }).split(' ').pop();
+            document.getElementById('timezone-info').textContent = tzName;
+
+            // Get ET time
+            const etOptions = { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false };
+            const etTime = now.toLocaleTimeString('en-GB', etOptions);
+            document.getElementById('et-time').textContent = etTime + ' ET';
+
+            // Calculate current hour in CET as decimal
+            const cetParts = cetTime.split(':');
+            const currentHour = parseInt(cetParts[0]) + parseInt(cetParts[1]) / 60;
+
+            // Update hour label highlighting
+            document.querySelectorAll('.hour-label').forEach(label => {
+                const hour = parseInt(label.dataset.hour);
+                label.classList.toggle('current', hour === Math.floor(currentHour));
+            });
+
+            // Update current time line on timelines
+            document.querySelectorAll('.timeline-bar').forEach(timeline => {
+                let timeLine = timeline.querySelector('.current-time-line');
+                if (!timeLine) {
+                    timeLine = document.createElement('div');
+                    timeLine.className = 'current-time-line';
+                    timeLine.innerHTML = '<div class="current-time-dot"></div>';
+                    timeline.appendChild(timeLine);
+                }
+                timeLine.style.left = (currentHour / 24 * 100) + '%';
+            });
+
+            // Update market statuses
+            updateMarketStatus('nyse', currentHour, markets.nyse);
+            updateMarketStatus('euronext', currentHour, markets.euronext);
+            updateMarketStatus('london', currentHour, markets.london);
+            updateMarketStatus('frankfurt', currentHour, markets.frankfurt);
+        }
+
+        function updateMarketStatus(marketId, currentHour, market) {
+            const statusEl = document.getElementById(marketId + '-status');
+            if (!statusEl) return;
+
+            let status = 'Closed';
+            let dotClass = 'closed';
+
+            // Check if weekend
+            const now = new Date();
+            const day = now.getDay();
+            const isWeekend = (day === 0 || day === 6);
+
+            if (!isWeekend) {
+                if (currentHour >= market.regular.start && currentHour < market.regular.end) {
+                    status = 'Open';
+                    dotClass = 'open';
+                } else if (currentHour >= market.premarket.start && currentHour < market.premarket.end) {
+                    status = 'Pre-Market';
+                    dotClass = 'premarket';
+                } else if (market.afterhours && currentHour >= market.afterhours.start && currentHour < market.afterhours.end) {
+                    status = 'After-Hours';
+                    dotClass = 'afterhours';
+                } else if (market.afterhours && market.afterhours.end > 24) {
+                    // Check wrapped after-hours (past midnight)
+                    if (currentHour < (market.afterhours.end - 24)) {
+                        status = 'After-Hours';
+                        dotClass = 'afterhours';
+                    }
+                }
+            }
+
+            statusEl.innerHTML = '<span class="status-dot ' + dotClass + '"></span>' + status;
+        }
+
+        // Initialize
+        buildTimeline();
+        updateCurrentTime();
+        setInterval(updateCurrentTime, 1000);
+    </script>
+</body>
+</html>
+"""
+
 
 def read_state_file():
     """Read state from JSON file (written by bot process)"""
@@ -1449,6 +2207,11 @@ async def get_dashboard():
 @app.get("/sectors", response_class=HTMLResponse)
 async def get_sectors():
     return SECTORS_HTML
+
+
+@app.get("/market-hours", response_class=HTMLResponse)
+async def get_market_hours():
+    return MARKET_HOURS_HTML
 
 
 @app.websocket("/ws")
@@ -1512,11 +2275,11 @@ async def get_stock_history(symbol: str, period: str = "1mo", interval: str = "1
         else:
             bar['ma21'] = None
 
-        # Calculate algo trading signals (MA crossover with 0.8% threshold)
+        # Calculate algo trading signals (MA crossover with 0.3% threshold)
         if i >= 20 and i > 0:  # Need MA21 and previous bar
             prev_bar = history[i-1]
             if prev_bar.get('ma8') and prev_bar.get('ma21') and bar['ma8'] and bar['ma21']:
-                threshold = 0.008  # 0.8% threshold matching AGGRESSIVE strategy
+                threshold = 0.008  # 0.8% threshold matching strategy
 
                 # BUY signal: MA8 crosses above MA21 * 1.008
                 if (prev_bar['ma8'] <= prev_bar['ma21'] * (1 + threshold) and
@@ -1577,9 +2340,42 @@ async def get_stock_info(symbol: str):
 
 @app.get("/api/stock/{symbol}/news")
 async def get_stock_news(symbol: str, limit: int = 10):
-    """Get extended news list"""
+    """Get extended news list with professional sentiment analysis"""
+    # Try Alpha Vantage first (professional news with AI sentiment)
+    if av_news_available and av_client:
+        try:
+            av_result = av_client.get_news_sentiment(symbol.upper(), limit=limit)
+            if av_result and av_result.get('articles'):
+                # Format for dashboard compatibility
+                formatted_news = []
+                for article in av_result['articles']:
+                    formatted_news.append({
+                        'title': article['title'],
+                        'link': article['url'],
+                        'source': article['source'],
+                        'time_ago': article['time_ago'],
+                        'sentiment': article['sentiment_label'],
+                        'sentiment_score': article['sentiment_score'],  # -1 to +1
+                        'relevance': article['relevance_score'],
+                        'summary': article.get('summary', '')
+                    })
+                return {
+                    "symbol": symbol.upper(),
+                    "news": formatted_news,
+                    "overall_sentiment": av_result['overall_sentiment'],
+                    "article_count": av_result['article_count'],
+                    "source": "Alpha Vantage (Professional AI Sentiment)"
+                }
+        except Exception as e:
+            print(f"Alpha Vantage news error: {e}")
+
+    # Fallback to YFinance if Alpha Vantage fails
     news = yf_client.get_news(symbol.upper(), limit=limit)
-    return {"symbol": symbol.upper(), "news": news}
+    return {
+        "symbol": symbol.upper(),
+        "news": news,
+        "source": "Yahoo Finance (VADER Sentiment)"
+    }
 
 
 @app.get("/api/stock/{symbol}/events")

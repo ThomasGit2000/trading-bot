@@ -199,6 +199,112 @@ class AlphaVantageClient:
             'description': data.get('Description')
         }
 
+    def get_news_sentiment(self, tickers: str, limit: int = 10) -> list:
+        """Get news with AI-powered sentiment analysis
+
+        Args:
+            tickers: Comma-separated ticker symbols (e.g., "AAPL,TSLA")
+            limit: Number of articles to return (default 10, max 50)
+
+        Returns:
+            List of news articles with sentiment scores
+        """
+        cache_key = f"news_{tickers}_{limit}"
+        if cache_key in self._cache:
+            cached_time, cached_data = self._cache[cache_key]
+            if datetime.now() - cached_time < timedelta(minutes=30):  # Cache for 30 minutes
+                return cached_data
+
+        data = self._request({
+            'function': 'NEWS_SENTIMENT',
+            'tickers': tickers,
+            'limit': limit,
+            'sort': 'LATEST'
+        })
+
+        if not data or 'feed' not in data:
+            logger.warning(f"No news data found for {tickers}")
+            return []
+
+        articles = []
+        for item in data.get('feed', [])[:limit]:
+            # Extract ticker-specific sentiment
+            ticker_sentiment = None
+            for ts in item.get('ticker_sentiment', []):
+                if ts.get('ticker') in tickers.split(','):
+                    ticker_sentiment = float(ts.get('ticker_sentiment_score', 0))
+                    break
+
+            # Use overall sentiment if ticker-specific not found
+            if ticker_sentiment is None:
+                ticker_sentiment = float(item.get('overall_sentiment_score', 0))
+
+            # Parse time published
+            time_published = item.get('time_published', '')
+            try:
+                dt = datetime.strptime(time_published, '%Y%m%dT%H%M%S')
+                time_ago = self._format_time_ago(dt)
+            except:
+                time_ago = 'Unknown'
+
+            # Map sentiment score to label
+            if ticker_sentiment >= 0.15:
+                sentiment_label = 'positive'
+            elif ticker_sentiment <= -0.15:
+                sentiment_label = 'negative'
+            else:
+                sentiment_label = 'neutral'
+
+            articles.append({
+                'title': item.get('title', 'No title'),
+                'url': item.get('url', ''),
+                'source': item.get('source', 'Unknown'),
+                'time_published': time_published,
+                'time_ago': time_ago,
+                'summary': item.get('summary', ''),
+                'sentiment_score': ticker_sentiment,  # -1 to +1 scale
+                'sentiment_label': sentiment_label,
+                'relevance_score': float(item.get('relevance_score', 0)),
+                'datetime': dt  # Store parsed datetime for sorting
+            })
+
+        # Sort by datetime (most recent first)
+        articles.sort(key=lambda x: x.get('datetime', datetime.min), reverse=True)
+
+        # Calculate overall sentiment (average of all articles)
+        if articles:
+            overall_sentiment = sum(a['sentiment_score'] for a in articles) / len(articles)
+        else:
+            overall_sentiment = 0.0
+
+        # Add overall sentiment to result
+        result = {
+            'articles': articles,
+            'overall_sentiment': overall_sentiment,
+            'article_count': len(articles)
+        }
+
+        self._cache[cache_key] = (datetime.now(), result)
+        logger.info(f"Alpha Vantage news: {len(articles)} articles for {tickers}, overall sentiment: {overall_sentiment:.2f}")
+        return result
+
+    def _format_time_ago(self, dt: datetime) -> str:
+        """Format datetime as 'X hours ago' or 'X days ago'"""
+        delta = datetime.now() - dt
+
+        if delta.days > 0:
+            return f"{delta.days}d ago"
+
+        hours = delta.seconds // 3600
+        if hours > 0:
+            return f"{hours}h ago"
+
+        minutes = delta.seconds // 60
+        if minutes > 0:
+            return f"{minutes}m ago"
+
+        return "Just now"
+
 
 # Convenience function for quick price checks
 def get_price(symbol: str) -> float:

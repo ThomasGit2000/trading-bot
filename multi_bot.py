@@ -51,19 +51,21 @@ load_dotenv()
 class StockTrader:
     """Manages trading for a single stock"""
 
-    def __init__(self, symbol: str, position_size: int, short_ma: int, long_ma: int, category: str = "UNCATEGORIZED", volume_filter: bool = False):
+    def __init__(self, symbol: str, position_size: int, short_ma: int, long_ma: int, threshold: float = 0.003, category: str = "UNCATEGORIZED", volume_filter: bool = False, rsi_period: int = 14):
         self.symbol = symbol
         self.position_size = position_size
         self.category = category
+        self.threshold = threshold
         self.strategy = SimpleStrategy(
             short_window=short_ma,
             long_window=long_ma,
-            threshold=0.01,
+            threshold=threshold,
             stop_loss_pct=None,  # NO STOPS
             trailing_stop_pct=None,  # NO STOPS
             min_hold_periods=0,
             volume_confirm_threshold=1.5 if volume_filter else 0,  # Disable volume filter if not enabled
-            volume_min_threshold=0.5 if volume_filter else 0
+            volume_min_threshold=0.5 if volume_filter else 0,
+            rsi_period=rsi_period
         )
         self.contract = Stock(symbol, 'SMART', 'USD')
         self.position = 0
@@ -87,6 +89,7 @@ class StockTrader:
         long_ma = 0
         signal = "WAIT"
         signal_strength = 0
+        rsi = 50  # Default RSI
 
         if len(self.strategy.prices) >= self.strategy.short_window:
             short_ma = sum(list(self.strategy.prices)[-self.strategy.short_window:]) / self.strategy.short_window
@@ -96,6 +99,9 @@ class StockTrader:
 
             # Calculate signal strength (-100 to +100)
             signal_strength, _ = self._calculate_probability(short_ma, long_ma)
+
+        # Get current RSI
+        rsi = self.strategy.get_current_rsi()
 
         return {
             'symbol': self.symbol,
@@ -108,6 +114,7 @@ class StockTrader:
             'position_size': self.position_size,
             'short_ma': short_ma,
             'long_ma': long_ma,
+            'rsi': rsi,
             'signal': signal,
             'prices_collected': len(self.strategy.prices),
             'data_source': self.data_source,
@@ -124,13 +131,11 @@ class StockTrader:
         Shows how close we are to actual BUY or SELL signals.
 
         Scale: -100 (SELL signal) to +100 (BUY signal)
-        - BUY triggers at: short_ma > long_ma * 1.01 (1% above)
-        - SELL triggers at: short_ma < long_ma * 0.99 (1% below)
         """
         if long_ma == 0:
             return (0, 0)
 
-        threshold = 0.01  # 1% threshold matching strategy
+        threshold = self.threshold  # Use configured threshold (0.3%)
 
         # Calculate the thresholds
         buy_threshold = long_ma * (1 + threshold)
@@ -221,6 +226,8 @@ class MultiStockBot:
         # Strategy settings
         self.short_ma = int(os.getenv('SHORT_MA', '10'))
         self.long_ma = int(os.getenv('LONG_MA', '30'))
+        self.ma_threshold = float(os.getenv('MA_THRESHOLD', '0.003'))
+        self.rsi_period = int(os.getenv('RSI_PERIOD', '14'))
         self.volume_filter = os.getenv('VOLUME_FILTER', 'false').lower() == 'true'
 
         # Bot settings
@@ -277,8 +284,10 @@ class MultiStockBot:
                 position_size=pos_size,
                 short_ma=self.short_ma,
                 long_ma=self.long_ma,
+                threshold=self.ma_threshold,
                 category=category,
-                volume_filter=self.volume_filter
+                volume_filter=self.volume_filter,
+                rsi_period=self.rsi_period
             )
             logger.info(f"Created trader for {symbol} [{category}] (size: {pos_size})")
 
@@ -290,7 +299,7 @@ class MultiStockBot:
 
         mode = "DRY RUN" if self.dry_run else "LIVE TRADING"
         logger.info(f"Multi-Stock Bot initialized - Symbols: {self.symbols}, Mode: {mode}")
-        logger.info(f"Strategy: NO STOPS MA({self.short_ma}/{self.long_ma})")
+        logger.info(f"Strategy: MA({self.short_ma}/{self.long_ma}) threshold={self.ma_threshold*100:.1f}%, RSI({self.rsi_period})")
 
     def preload_historical_data(self):
         """Pre-load historical prices from IBKR so MAs have meaningful values at startup"""
@@ -825,15 +834,21 @@ class MultiStockBot:
         try:
             import json
             state_file = os.path.join(os.path.dirname(__file__), 'data', 'bot_state.json')
+            logger.info(f"Writing state to: {state_file}")
             with open(state_file, 'w') as f:
                 json.dump(state_data, f)
-        except Exception:
-            pass  # Silently ignore file write errors
+            logger.info(f"State file written successfully ({len(state_data.get('stocks', []))} stocks)")
+        except Exception as e:
+            logger.error(f"Failed to write state file to {state_file}: {e}")
 
     def start(self):
         """Start the trading bot"""
         logger.info("Starting Multi-Stock Trading Bot...")
         logger.info(f"Trading: {', '.join(self.symbols)}")
+
+        # Force trading to start disabled for safety - must be enabled from dashboard
+        trading_control.disable(by="bot_startup")
+        logger.info("Trading control: DISABLED (must enable from dashboard)")
 
         if not self.dry_run:
             logger.warning("LIVE TRADING MODE - Real money will be used!")
