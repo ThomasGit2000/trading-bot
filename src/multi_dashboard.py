@@ -49,7 +49,7 @@ DASHBOARD_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Master Board - MA(8/21) Pure Momentum | No RSI Filter</title>
+    <title>Master Board - Breakout Strategy | 60-tick Range</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -250,12 +250,21 @@ DASHBOARD_HTML = """
 </head>
 <body>
     <div class="header">
-        <div style="display: flex; flex-direction: column; gap: 2px;">
-            <h1 style="font-size: 20px;">Master Board</h1>
-            <span style="font-size: 14px; color: #8b949e;">MA(8/21) Pure Momentum | No Filters | 0.8% Threshold</span>
+        <div style="display: flex; align-items: center; gap: 16px;">
+            <div style="display: flex; flex-direction: column; gap: 2px;">
+                <h1 style="font-size: 20px;">Master Board</h1>
+                <span style="font-size: 14px; color: #8b949e;">Breakout Strategy | 60-tick Range | 0.2% Threshold | ATR >= 0.05% | 24/7</span>
+            </div>
+            <a href="/models" class="nav-btn" style="padding:8px 16px;font-size:12px;background:linear-gradient(135deg,#58a6ff,#a371f7);border:none;color:#fff;font-weight:700;">Models</a>
+            <a href="/alpha-cake" class="nav-btn" style="padding:8px 16px;font-size:12px;background:linear-gradient(135deg,#ffd700,#ff6b6b);border:none;color:#000;font-weight:700;">Alpha Cake</a>
         </div>
         <div style="display: flex; gap: 8px; align-items: flex-end;">
-            <div style="display:flex;gap:4px;align-items:flex-end;height:100%;">
+            <div style="display:flex;gap:4px;align-items:center;height:100%;">
+                <div id="traffic-light" style="display:flex;gap:2px;padding:2px 6px;background:#21262d;border-radius:8px;" title="Price updates">
+                    <span id="tl-green" style="width:10px;height:10px;border-radius:50%;background:#6e7681;"></span>
+                    <span id="tl-yellow" style="width:10px;height:10px;border-radius:50%;background:#6e7681;"></span>
+                    <span id="tl-red" style="width:10px;height:10px;border-radius:50%;background:#6e7681;"></span>
+                </div>
                 <span id="net-liq" class="status-badge" style="background:#1f6feb;font-weight:700;font-size:12px;" title="Net Liquidation Value">
                     Net: -- DKK
                 </span>
@@ -293,23 +302,26 @@ DASHBOARD_HTML = """
         <thead>
             <tr>
                 <th style="width:30px;text-align:center;">#</th>
-                <th class="sortable" data-sort="symbol" onclick="sortTable('symbol')">Symbol <span class="sort-arrow"></span></th>
+                <th class="sortable" data-sort="symbol" onclick="sortTable('symbol')" style="width:140px;">Symbol <span class="sort-arrow"></span></th>
                 <th class="sortable" data-sort="category" onclick="sortTable('category')">Category <span class="sort-arrow"></span></th>
                 <th class="sortable" data-sort="days_to_event" onclick="sortTable('days_to_event')">Event <span class="sort-arrow"></span></th>
                 <th class="sortable" data-sort="price" onclick="sortTable('price')">Price <span class="sort-arrow"></span></th>
                 <th>Trend</th>
                 <th class="sortable" data-sort="position" onclick="sortTable('position')">Pos <span class="sort-arrow"></span></th>
                 <th class="sortable" data-sort="position_size" onclick="sortTable('position_size')">Target <span class="sort-arrow"></span></th>
+                <th style="width:80px;">Ticks</th>
                 <th class="sortable" data-sort="prices_collected" onclick="sortTable('prices_collected')">Data <span class="sort-arrow"></span></th>
+                <th>ATR</th>
+                <th>StopOut</th>
                 <th class="sortable" data-sort="signal" onclick="sortTable('signal')">Signal <span class="sort-arrow"></span></th>
-                <th class="sortable" data-sort="short_ma" onclick="sortTable('short_ma')">MA(8) <span class="sort-arrow"></span></th>
-                <th class="sortable" data-sort="long_ma" onclick="sortTable('long_ma')">MA(21) <span class="sort-arrow"></span></th>
+                <th id="col-short" class="sortable" data-sort="short_ma" onclick="sortTable('short_ma')">Range Hi <span class="sort-arrow"></span></th>
+                <th id="col-long" class="sortable" data-sort="long_ma" onclick="sortTable('long_ma')">Range Lo <span class="sort-arrow"></span></th>
                 <th class="sortable" data-sort="rsi" onclick="sortTable('rsi')">RSI <span class="sort-arrow"></span></th>
                 <th class="sortable" data-sort="signal_strength" onclick="sortTable('signal_strength')">Sentiment <span class="sort-arrow"></span></th>
             </tr>
         </thead>
         <tbody id="stocks-body">
-            <tr><td colspan="14" style="text-align:center;color:#8b949e;">Loading...</td></tr>
+            <tr><td colspan="17" style="text-align:center;color:#8b949e;">Loading...</td></tr>
         </tbody>
     </table>
 
@@ -441,27 +453,76 @@ DASHBOARD_HTML = """
         let priceChart = null;
         let latestStocksData = [];
         let currentSort = { column: null, direction: 'asc' };
+        let lastDataHash = '';  // Track data changes to avoid unnecessary DOM updates
 
-        function connect() {
-            ws = new WebSocket(`ws://${window.location.host}/ws`);
-            ws.onopen = () => {
-                document.getElementById('connection-status').textContent = 'WS: LIVE';
+        // Traffic light tracking
+        let lastHeartbeatPrice = null;
+        let lastHeartbeatTime = Date.now();
+
+        // Update traffic light every second
+        setInterval(() => {
+            const green = document.getElementById('tl-green');
+            const yellow = document.getElementById('tl-yellow');
+            const red = document.getElementById('tl-red');
+            const elapsed = (Date.now() - lastHeartbeatTime) / 1000;
+
+            // Reset all to grey
+            green.style.background = '#6e7681';
+            yellow.style.background = '#6e7681';
+            red.style.background = '#6e7681';
+
+            if (elapsed <= 5) {
+                green.style.background = '#3fb950'; // Green - updating
+            } else if (elapsed <= 10) {
+                yellow.style.background = '#f0883e'; // Yellow - slow
+            } else {
+                red.style.background = '#da3633'; // Red - stale
+            }
+
+            document.getElementById('traffic-light').title = 'Last update: ' + Math.round(elapsed) + 's ago';
+        }, 1000);
+
+        async function fetchData() {
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 4000);  // 4s timeout
+                const res = await fetch('/api/stocks', { signal: controller.signal });
+                clearTimeout(timeoutId);
+                const data = await res.json();
+
+                document.getElementById('connection-status').textContent = 'POLL: OK';
                 document.getElementById('connection-status').className = 'status-badge status-live';
-            };
-            ws.onmessage = (e) => {
-                const data = JSON.parse(e.data);
+
                 latestStocksData = data.stocks || [];
+                window.dataRequirement = data.data_requirement || 60;
+                window.strategyType = data.strategy_type || 'BREAKOUT';
+
+                // Traffic light - check first stock price
+                if (data.stocks && data.stocks.length > 0) {
+                    const price = data.stocks[0].price;
+                    if (price !== lastHeartbeatPrice) {
+                        lastHeartbeatPrice = price;
+                        lastHeartbeatTime = Date.now();
+                    }
+                }
+
                 updateDashboard(data);
                 if (modalOpen && modalSymbol) {
                     const stock = data.stocks?.find(s => s.symbol === modalSymbol);
                     if (stock) updateModalRealtime(stock);
                 }
-            };
-            ws.onclose = () => {
-                document.getElementById('connection-status').textContent = 'WS: OFF';
-                document.getElementById('connection-status').className = 'status-badge status-disconnected';
-                setTimeout(connect, 2000);
-            };
+            } catch (e) {
+                console.error('Fetch error:', e);
+                const status = document.getElementById('connection-status');
+                status.textContent = e.name === 'AbortError' ? 'POLL: TIMEOUT' : 'POLL: ERR';
+                status.className = 'status-badge status-disconnected';
+            }
+        }
+
+        function connect() {
+            // Poll every 5 seconds (reduced from 2 to prevent browser freeze)
+            fetchData();
+            setInterval(fetchData, 5000);
         }
 
         function updateMarketStatus() {
@@ -583,11 +644,18 @@ DASHBOARD_HTML = """
 
             const body = document.getElementById('stocks-body');
             if (data.stocks && data.stocks.length > 0) {
-                let stocks = [...data.stocks];
-                if (currentSort.column) {
-                    stocks = sortStocks(stocks, currentSort.column, currentSort.direction);
+                // Create a simple hash of key data to detect changes
+                const dataHash = data.stocks.map(s => `${s.symbol}:${s.price}:${s.signal}:${s.position}`).join('|');
+
+                // Only rebuild table if data actually changed
+                if (dataHash !== lastDataHash) {
+                    lastDataHash = dataHash;
+                    let stocks = [...data.stocks];
+                    if (currentSort.column) {
+                        stocks = sortStocks(stocks, currentSort.column, currentSort.direction);
+                    }
+                    body.innerHTML = stocks.map((s, i) => createRow(s, i + 1)).join('');
                 }
-                body.innerHTML = stocks.map((s, i) => createRow(s, i + 1)).join('');
             }
 
             document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
@@ -785,7 +853,7 @@ DASHBOARD_HTML = """
             const companyName = getCompanyName(s.symbol);
 
             return `
-                <tr class="${hasPos ? 'has-position' : ''}" onclick="openModal('${s.symbol}', ${JSON.stringify(s).replace(/"/g, '&quot;')})">
+                <tr class="${hasPos ? 'has-position' : ''}" onclick="openModal('${s.symbol}')">
                     <td style="text-align:center;color:#8b949e;font-size:11px;">${rowNum}</td>
                     <td>
                         <div style="display:flex;align-items:center;gap:8px;">
@@ -807,7 +875,10 @@ DASHBOARD_HTML = """
                     <td>${createSparkline(s.price_history || [], s.price)}</td>
                     <td class="${hasPos ? 'position' : 'no-position'}">${s.position || 0}</td>
                     <td>${s.position_size}</td>
-                    <td>${s.prices_collected}/21</td>
+                    <td>${createSparkline(s.tick_prices || [], s.price, 80)}</td>
+                    <td>${s.prices_collected >= (window.dataRequirement || 60) ? '<span style="color:#3fb950;">READY</span>' : s.prices_collected + '/' + (window.dataRequirement || 60)}</td>
+                    <td style="text-align:center;"><span style="color:${s.atr_ok !== false ? '#3fb950' : '#f85149'};">${((s.atr_pct || 0) * 100).toFixed(2)}%</span></td>
+                    <td style="text-align:center;">${s.stop_out === 'TRAIL' ? '<span style="color:#f85149;font-weight:600;">Trail</span>' : s.stop_out === 'LOSS' ? '<span style="color:#f85149;font-weight:600;">Loss</span>' : '<span style="color:#8b949e;">--</span>'}</td>
                     <td>
                         <span class="signal-label ${sigClass}">${s.signal || 'WAIT'}</span>
                         <div class="signal-bar"><div class="signal-indicator" style="left:${sigPos}%"></div></div>
@@ -861,14 +932,14 @@ DASHBOARD_HTML = """
             return diffDays < 0 ? 9999 : diffDays;
         }
 
-        function createSparkline(prices, currentPrice) {
+        function createSparkline(prices, currentPrice, customWidth) {
             if (!prices || prices.length < 2) {
                 return '<span style="color:#8b949e;font-size:10px;">--</span>';
             }
 
-            const width = 60;
+            const width = customWidth || 60;
             const height = 20;
-            const data = prices.slice(-30);  // Last 30 data points
+            const data = prices.slice(-60);  // Last 60 data points
 
             const min = Math.min(...data);
             const max = Math.max(...data);
@@ -917,7 +988,8 @@ DASHBOARD_HTML = """
         // Modal Functions
         async function openModal(symbol, stockData) {
             modalSymbol = symbol;
-            modalStockData = stockData;
+            // Look up stock data from cached data if not provided
+            modalStockData = stockData || latestStocksData.find(s => s.symbol === symbol) || {};
             modalOpen = true;
 
             document.getElementById('stock-modal').classList.add('active');
@@ -941,8 +1013,10 @@ DASHBOARD_HTML = """
             fallbackEl.textContent = logoLetter;
             fallbackEl.style.background = logoColor;
 
-            // Update with initial data
-            updateModalRealtime(stockData);
+            // Update with initial data (use resolved modalStockData, not the parameter)
+            if (modalStockData && modalStockData.price) {
+                updateModalRealtime(modalStockData);
+            }
 
             // Fetch additional data
             await Promise.all([
@@ -1219,7 +1293,7 @@ DASHBOARD_HTML = """
                                 pointRadius: 0
                             },
                             {
-                                label: 'MA(8)',
+                                label: 'Range Hi',
                                 data: ma8,
                                 borderColor: '#f0883e',
                                 borderWidth: 1.5,
@@ -1229,7 +1303,7 @@ DASHBOARD_HTML = """
                                 pointRadius: 0
                             },
                             {
-                                label: 'MA(21)',
+                                label: 'Range Lo',
                                 data: ma21,
                                 borderColor: '#58a6ff',
                                 borderWidth: 1.5,
@@ -2192,16 +2266,38 @@ def read_state_file():
     import os
     state_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'bot_state.json')
     try:
-        with open(state_file, 'r') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+        with open(state_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+        return json.loads(content)
+    except (FileNotFoundError, json.JSONDecodeError, IOError) as e:
         # Fall back to in-memory state if file not available
         return bot_state.get_state()
 
 
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard():
-    return DASHBOARD_HTML
+    import os
+    from dotenv import dotenv_values
+
+    # Read current settings from .env
+    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
+    config = dotenv_values(env_path)
+
+    strategy = config.get('STRATEGY_TYPE', 'BREAKOUT')
+    lookback = config.get('BREAKOUT_LOOKBACK', '60')
+    threshold = float(config.get('BREAKOUT_THRESHOLD', '0.002')) * 100
+    atr_filter = config.get('ATR_FILTER', 'true').lower() == 'true'
+    atr_min = float(config.get('ATR_MIN_THRESHOLD', '0.001')) * 100
+
+    atr_text = f"ATR >= {atr_min:.2f}%" if atr_filter else "ATR OFF"
+    subheader = f"{strategy} Strategy | {lookback}-tick Range | {threshold:.1f}% Threshold | {atr_text} | 24/7"
+
+    # Replace the static subheader with dynamic values
+    html = DASHBOARD_HTML.replace(
+        'Breakout Strategy | 60-tick Range | 0.2% Threshold | ATR >= 0.05% | 24/7',
+        subheader
+    )
+    return html
 
 
 @app.get("/sectors", response_class=HTMLResponse)
@@ -2214,12 +2310,468 @@ async def get_market_hours():
     return MARKET_HOURS_HTML
 
 
+@app.get("/alpha-cake", response_class=HTMLResponse)
+async def get_alpha_cake():
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Alpha Cake - Signal Layers</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Righteous&display=swap');
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            min-height: 100vh;
+            background: #0d1117;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+            color: #c9d1d9;
+            padding: 20px;
+        }
+        .nav-btn {
+            display: inline-block;
+            padding: 6px 14px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 600;
+            background: #21262d;
+            border: 1px solid #30363d;
+            color: #c9d1d9;
+            text-decoration: none;
+            transition: all 0.2s;
+            margin-bottom: 20px;
+        }
+        .nav-btn:hover { background: #30363d; border-color: #58a6ff; color: #58a6ff; }
+
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+        .title {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 48px;
+            font-weight: 900;
+            background: linear-gradient(180deg, #ffd700 0%, #ff8c00 50%, #ff6b6b 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            filter: drop-shadow(0 0 20px rgba(255, 215, 0, 0.5));
+            letter-spacing: 4px;
+        }
+        .subtitle {
+            font-family: 'Righteous', sans-serif;
+            font-size: 24px;
+            background: linear-gradient(180deg, #ff69b4 0%, #ff1493 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-top: -5px;
+            letter-spacing: 8px;
+        }
+        .tagline {
+            color: #8b949e;
+            font-size: 14px;
+            margin-top: 10px;
+        }
+
+        .container {
+            display: flex;
+            gap: 40px;
+            max-width: 1400px;
+            margin: 0 auto;
+            align-items: flex-start;
+        }
+
+        .cake-visual {
+            flex: 0 0 500px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .cake {
+            position: relative;
+            width: 100%;
+        }
+
+        .cherry {
+            width: 30px;
+            height: 30px;
+            background: radial-gradient(circle at 30% 30%, #ff6b6b, #dc143c);
+            border-radius: 50%;
+            margin: 0 auto 5px;
+            box-shadow: 0 4px 15px rgba(220, 20, 60, 0.5);
+            position: relative;
+        }
+        .cherry::before {
+            content: '';
+            position: absolute;
+            top: -15px;
+            left: 50%;
+            width: 3px;
+            height: 15px;
+            background: #228b22;
+            border-radius: 2px;
+        }
+
+        .layer {
+            position: relative;
+            margin: 0 auto;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: white;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.5);
+            transition: all 0.3s ease;
+            cursor: pointer;
+            overflow: hidden;
+        }
+        .layer:hover {
+            transform: scale(1.02);
+            z-index: 10;
+        }
+        .layer::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            transition: left 0.5s;
+        }
+        .layer:hover::before {
+            left: 100%;
+        }
+
+        .layer-7 { width: 120px; height: 35px; background: linear-gradient(135deg, #ffd700, #ffaa00); }
+        .layer-6 { width: 160px; height: 38px; background: linear-gradient(135deg, #ff8c00, #ff6600); margin-top: -2px; }
+        .layer-5 { width: 200px; height: 40px; background: linear-gradient(135deg, #ff6b6b, #e74c3c); margin-top: -2px; }
+        .layer-4 { width: 250px; height: 42px; background: linear-gradient(135deg, #e91e63, #c2185b); margin-top: -2px; }
+        .layer-3 { width: 300px; height: 45px; background: linear-gradient(135deg, #9c27b0, #7b1fa2); margin-top: -2px; }
+        .layer-2 { width: 370px; height: 50px; background: linear-gradient(135deg, #3f51b5, #303f9f); margin-top: -2px; }
+        .layer-1 { width: 450px; height: 60px; background: linear-gradient(135deg, #1a1a2e, #16213e); margin-top: -2px; border: 2px solid #da3633; }
+
+        .plate {
+            width: 480px;
+            height: 20px;
+            background: linear-gradient(180deg, #8b949e, #6e7681);
+            border-radius: 0 0 50% 50% / 0 0 100% 100%;
+            margin-top: 5px;
+        }
+
+        .layer-info {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .info-card {
+            background: #161b22;
+            border: 2px solid #30363d;
+            border-radius: 8px;
+            padding: 16px;
+            transition: all 0.3s ease;
+        }
+        .info-card:hover {
+            border-color: #58a6ff;
+            transform: translateX(5px);
+        }
+        .info-card.active {
+            border-color: #ffd700;
+            box-shadow: 0 0 20px rgba(255, 215, 0, 0.2);
+        }
+
+        .info-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 8px;
+        }
+        .info-icon {
+            font-size: 24px;
+        }
+        .info-title {
+            font-weight: 700;
+            font-size: 16px;
+        }
+        .info-desc {
+            color: #8b949e;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+        .info-signals {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 10px;
+        }
+        .signal-tag {
+            background: #21262d;
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            color: #58a6ff;
+            border: 1px solid #30363d;
+        }
+
+        .layer-1-card { border-color: #da3633; }
+        .layer-1-card .info-title { color: #da3633; }
+        .layer-2-card { border-color: #3f51b5; }
+        .layer-2-card .info-title { color: #3f51b5; }
+        .layer-3-card { border-color: #9c27b0; }
+        .layer-3-card .info-title { color: #9c27b0; }
+        .layer-4-card { border-color: #e91e63; }
+        .layer-4-card .info-title { color: #e91e63; }
+        .layer-5-card { border-color: #ff6b6b; }
+        .layer-5-card .info-title { color: #ff6b6b; }
+        .layer-6-card { border-color: #ff8c00; }
+        .layer-6-card .info-title { color: #ff8c00; }
+        .layer-7-card { border-color: #ffd700; }
+        .layer-7-card .info-title { color: #ffd700; }
+
+        .arrow {
+            position: absolute;
+            right: -30px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #30363d;
+            font-size: 20px;
+            opacity: 0;
+            transition: all 0.3s;
+        }
+        .layer:hover .arrow {
+            opacity: 1;
+            right: -40px;
+            color: #58a6ff;
+        }
+
+        .flow-indicator {
+            text-align: center;
+            margin: 30px 0;
+            color: #8b949e;
+            font-size: 12px;
+        }
+        .flow-indicator .arrow-up {
+            font-size: 24px;
+            color: #3fb950;
+            animation: bounce 1s infinite;
+        }
+        @keyframes bounce {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-5px); }
+        }
+    </style>
+</head>
+<body>
+    <a href="/" class="nav-btn">← Dashboard</a>
+
+    <div class="header">
+        <div class="title">ALPHA</div>
+        <div class="subtitle">CAKE</div>
+        <div class="tagline">Layered Signal Analysis Framework</div>
+    </div>
+
+    <div class="container">
+        <div class="cake-visual">
+            <div class="cake">
+                <div class="layer layer-7" data-layer="7">Earnings<span class="arrow">→</span></div>
+                <div class="layer layer-6" data-layer="6">Events<span class="arrow">→</span></div>
+                <div class="layer layer-5" data-layer="5">Management<span class="arrow">→</span></div>
+                <div class="layer layer-4" data-layer="4">Competition<span class="arrow">→</span></div>
+                <div class="layer layer-3" data-layer="3">Sector<span class="arrow">→</span></div>
+                <div class="layer layer-2" data-layer="2">Macro Economics<span class="arrow">→</span></div>
+                <div class="layer layer-1" data-layer="1">Geopolitical<span class="arrow">→</span></div>
+                <div class="plate"></div>
+            </div>
+            <div class="flow-indicator">
+                <div class="arrow-up">↑</div>
+                <div>Signals flow up through layers</div>
+                <div>Base events trigger rotations above</div>
+            </div>
+        </div>
+
+        <div class="layer-info">
+            <div class="info-card layer-7-card" data-layer="7">
+                <div class="info-header">
+                    <span class="info-icon">💰</span>
+                    <span class="info-title">Layer 7: Earnings</span>
+                </div>
+                <div class="info-desc">
+                    The top layer - quarterly earnings reports. Revenue, EPS, guidance, and surprises.
+                    This is where all lower layers manifest into actual numbers. Beat or miss.
+                </div>
+                <div class="info-signals">
+                    <span class="signal-tag">Revenue</span>
+                    <span class="signal-tag">EPS</span>
+                    <span class="signal-tag">Guidance</span>
+                    <span class="signal-tag">Margins</span>
+                    <span class="signal-tag">Surprise %</span>
+                    <span class="signal-tag">Whisper Numbers</span>
+                </div>
+            </div>
+
+            <div class="info-card layer-6-card" data-layer="6">
+                <div class="info-header">
+                    <span class="info-icon">📅</span>
+                    <span class="info-title">Layer 6: Upcoming Events</span>
+                </div>
+                <div class="info-desc">
+                    Scheduled catalysts that move stocks. Product launches, FDA approvals, conferences,
+                    and investor days. Known events with unknown outcomes.
+                </div>
+                <div class="info-signals">
+                    <span class="signal-tag">Product Launch</span>
+                    <span class="signal-tag">FDA Decisions</span>
+                    <span class="signal-tag">Conferences</span>
+                    <span class="signal-tag">Investor Day</span>
+                    <span class="signal-tag">Splits/Dividends</span>
+                </div>
+            </div>
+
+            <div class="info-card layer-5-card" data-layer="5">
+                <div class="info-header">
+                    <span class="info-icon">👔</span>
+                    <span class="info-title">Layer 5: Management & Leadership</span>
+                </div>
+                <div class="info-desc">
+                    Executive changes, insider activity, and corporate governance.
+                    CEO transitions, board changes, and leadership track records signal future direction.
+                </div>
+                <div class="info-signals">
+                    <span class="signal-tag">CEO Changes</span>
+                    <span class="signal-tag">Insider Buying</span>
+                    <span class="signal-tag">Insider Selling</span>
+                    <span class="signal-tag">Board Changes</span>
+                    <span class="signal-tag">Guidance Style</span>
+                </div>
+            </div>
+
+            <div class="info-card layer-4-card" data-layer="4">
+                <div class="info-header">
+                    <span class="info-icon">⚔️</span>
+                    <span class="info-title">Layer 4: Competitive Landscape</span>
+                </div>
+                <div class="info-desc">
+                    Direct competitors and market share battles. A competitor's weakness is your opportunity.
+                    M&A activity, market disruption, and competitive moats.
+                </div>
+                <div class="info-signals">
+                    <span class="signal-tag">Market Share</span>
+                    <span class="signal-tag">M&A Activity</span>
+                    <span class="signal-tag">New Entrants</span>
+                    <span class="signal-tag">Price Wars</span>
+                    <span class="signal-tag">Disruption</span>
+                </div>
+            </div>
+
+            <div class="info-card layer-3-card" data-layer="3">
+                <div class="info-header">
+                    <span class="info-icon">🏭</span>
+                    <span class="info-title">Layer 3: Sector Dynamics</span>
+                </div>
+                <div class="info-desc">
+                    Industry-wide trends and rotations. Tech vs Value, Growth vs Defensive.
+                    Sector ETF flows and industry-specific regulations impact all companies within.
+                </div>
+                <div class="info-signals">
+                    <span class="signal-tag">Sector Rotation</span>
+                    <span class="signal-tag">Industry Trends</span>
+                    <span class="signal-tag">Regulations</span>
+                    <span class="signal-tag">Supply Chain</span>
+                    <span class="signal-tag">Commodity Prices</span>
+                </div>
+            </div>
+
+            <div class="info-card layer-2-card" data-layer="2">
+                <div class="info-header">
+                    <span class="info-icon">📊</span>
+                    <span class="info-title">Layer 2: Macro Economics</span>
+                </div>
+                <div class="info-desc">
+                    Global economic factors that affect all markets. Interest rates, inflation, and monetary policy
+                    determine the overall market direction and risk appetite.
+                </div>
+                <div class="info-signals">
+                    <span class="signal-tag">Interest Rates</span>
+                    <span class="signal-tag">Inflation (CPI/PPI)</span>
+                    <span class="signal-tag">GDP Growth</span>
+                    <span class="signal-tag">Unemployment</span>
+                    <span class="signal-tag">Fed Policy</span>
+                    <span class="signal-tag">Bond Yields</span>
+                </div>
+            </div>
+
+            <div class="info-card layer-1-card" data-layer="1">
+                <div class="info-header">
+                    <span class="info-icon">🌍</span>
+                    <span class="info-title">Layer 1: Geopolitical Events</span>
+                </div>
+                <div class="info-desc">
+                    The foundation layer. War, conflicts, sanctions, and political shifts create massive market rotations.
+                    These events ripple through ALL layers above, triggering sector rotations and flight-to-safety moves.
+                </div>
+                <div class="info-signals">
+                    <span class="signal-tag">War / Conflicts</span>
+                    <span class="signal-tag">Sanctions</span>
+                    <span class="signal-tag">Elections</span>
+                    <span class="signal-tag">Trade Wars</span>
+                    <span class="signal-tag">Regime Change</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.querySelectorAll('.layer').forEach(layer => {
+            layer.addEventListener('mouseenter', () => {
+                const layerNum = layer.dataset.layer;
+                document.querySelectorAll('.info-card').forEach(card => {
+                    card.classList.remove('active');
+                    if (card.dataset.layer === layerNum) {
+                        card.classList.add('active');
+                        card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                    }
+                });
+            });
+        });
+
+        document.querySelectorAll('.info-card').forEach(card => {
+            card.addEventListener('mouseenter', () => {
+                const layerNum = card.dataset.layer;
+                document.querySelectorAll('.layer').forEach(layer => {
+                    if (layer.dataset.layer === layerNum) {
+                        layer.style.transform = 'scale(1.05)';
+                        layer.style.zIndex = '10';
+                    }
+                });
+            });
+            card.addEventListener('mouseleave', () => {
+                document.querySelectorAll('.layer').forEach(layer => {
+                    layer.style.transform = '';
+                    layer.style.zIndex = '';
+                });
+            });
+        });
+    </script>
+</body>
+</html>
+"""
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            state = read_state_file()
+            # Use thread pool to avoid blocking event loop with file I/O
+            state = await asyncio.to_thread(read_state_file)
             await websocket.send_json(state)
             await asyncio.sleep(1)
     except WebSocketDisconnect:
@@ -2229,9 +2781,329 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 
+@app.get("/models", response_class=HTMLResponse)
+async def get_models():
+    import json
+    import os
+    models_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'models.json')
+    try:
+        with open(models_path, 'r') as f:
+            models_data = json.load(f)
+    except:
+        models_data = {"models": {}, "active_model": "BREAKOUT"}
+
+    models = models_data.get("models", {})
+    active = models_data.get("active_model", "BREAKOUT")
+
+    # Build model cards HTML
+    model_cards = ""
+    for key, model in models.items():
+        is_active = key == active
+        status_class = "active" if is_active else "saved"
+        status_text = "ACTIVE" if is_active else "SAVED"
+
+        params_html = ""
+        for pkey, pval in model.get("parameters", {}).items():
+            params_html += f'<div class="param-row"><span class="param-key">{pkey}</span><span class="param-val">{pval}</span></div>'
+
+        backtest = model.get("backtest_results", {})
+        backtest_html = ""
+        if "net_return" in backtest:
+            net_class = "positive" if backtest["net_return"] > 0 else "negative"
+            backtest_html = f'''
+                <div class="backtest-results">
+                    <div class="result-row"><span>NET Return:</span><span class="{net_class}">{backtest["net_return"]:+.2f}%</span></div>
+                    <div class="result-row"><span>Win Rate:</span><span>{backtest.get("win_rate", 0):.1f}%</span></div>
+                    <div class="result-row"><span>Trades:</span><span>{backtest.get("trades", 0)}</span></div>
+                    <div class="result-row"><span>Commission:</span><span>${backtest.get("commission", 0):.0f}</span></div>
+                </div>
+            '''
+        elif "note" in backtest:
+            backtest_html = f'<div class="backtest-note">{backtest["note"]}</div>'
+
+        model_cards += f'''
+            <div class="model-card {status_class}">
+                <div class="model-header">
+                    <div class="model-name">{model.get("name", key)}</div>
+                    <span class="model-status {status_class}">{status_text}</span>
+                </div>
+                <div class="model-desc">{model.get("description", "")}</div>
+                <div class="model-params">
+                    <div class="params-title">Parameters</div>
+                    {params_html}
+                </div>
+                {backtest_html}
+                <div class="model-actions">
+                    {"<span class='current-badge'>Currently Running</span>" if is_active else "<button class='activate-btn' onclick='activateModel(" + '"' + key + '"' + ")'>Activate Model</button>"}
+                </div>
+            </div>
+        '''
+
+    return f'''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Trading Models - Strategy Manager</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            min-height: 100vh;
+            background: #0d1117;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+            color: #c9d1d9;
+            padding: 20px;
+        }}
+        .nav-btn {{
+            display: inline-block;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 600;
+            background: #21262d;
+            border: 1px solid #30363d;
+            color: #c9d1d9;
+            text-decoration: none;
+            transition: all 0.2s;
+            margin-bottom: 20px;
+        }}
+        .nav-btn:hover {{ background: #30363d; border-color: #58a6ff; color: #58a6ff; }}
+
+        .header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid #30363d;
+        }}
+        .title {{
+            font-size: 28px;
+            font-weight: 700;
+            background: linear-gradient(135deg, #58a6ff, #a371f7);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }}
+        .subtitle {{ color: #8b949e; font-size: 14px; margin-top: 4px; }}
+
+        .models-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 20px;
+            max-width: 1400px;
+        }}
+        .model-card {{
+            background: #161b22;
+            border: 2px solid #30363d;
+            border-radius: 12px;
+            padding: 20px;
+            transition: all 0.3s;
+        }}
+        .model-card:hover {{ border-color: #58a6ff; }}
+        .model-card.active {{ border-color: #238636; box-shadow: 0 0 20px rgba(35, 134, 54, 0.3); }}
+
+        .model-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }}
+        .model-name {{ font-size: 18px; font-weight: 700; color: #58a6ff; }}
+        .model-status {{
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+        }}
+        .model-status.active {{ background: #238636; color: white; }}
+        .model-status.saved {{ background: #30363d; color: #8b949e; }}
+
+        .model-desc {{
+            color: #8b949e;
+            font-size: 13px;
+            line-height: 1.5;
+            margin-bottom: 16px;
+        }}
+        .model-params {{
+            background: #0d1117;
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 16px;
+        }}
+        .params-title {{
+            font-size: 10px;
+            color: #8b949e;
+            text-transform: uppercase;
+            margin-bottom: 8px;
+            font-weight: 600;
+        }}
+        .param-row {{
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            padding: 4px 0;
+            border-bottom: 1px solid #21262d;
+        }}
+        .param-row:last-child {{ border-bottom: none; }}
+        .param-key {{ color: #8b949e; }}
+        .param-val {{ color: #c9d1d9; font-weight: 600; font-family: monospace; }}
+
+        .backtest-results {{
+            background: #0d1117;
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 16px;
+        }}
+        .result-row {{
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            padding: 4px 0;
+        }}
+        .result-row .positive {{ color: #3fb950; font-weight: 700; }}
+        .result-row .negative {{ color: #f85149; font-weight: 700; }}
+
+        .backtest-note {{
+            background: #0d1117;
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 16px;
+            font-size: 12px;
+            color: #8b949e;
+            font-style: italic;
+        }}
+
+        .model-actions {{ text-align: center; }}
+        .activate-btn {{
+            background: linear-gradient(135deg, #238636, #2ea043);
+            border: none;
+            color: white;
+            padding: 10px 24px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.2s;
+        }}
+        .activate-btn:hover {{ transform: scale(1.05); box-shadow: 0 0 15px rgba(35, 134, 54, 0.5); }}
+        .current-badge {{
+            display: inline-block;
+            background: #238636;
+            color: white;
+            padding: 10px 24px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 700;
+        }}
+
+        .info-box {{
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 16px;
+            margin-top: 30px;
+            max-width: 600px;
+        }}
+        .info-box h3 {{ font-size: 14px; margin-bottom: 8px; color: #58a6ff; }}
+        .info-box p {{ font-size: 12px; color: #8b949e; line-height: 1.6; }}
+    </style>
+</head>
+<body>
+    <a href="/" class="nav-btn">Back to Dashboard</a>
+
+    <div class="header">
+        <div>
+            <div class="title">Trading Models</div>
+            <div class="subtitle">Strategy Manager - Compare and Activate Trading Strategies</div>
+        </div>
+    </div>
+
+    <div class="models-grid">
+        {model_cards}
+    </div>
+
+    <div class="info-box">
+        <h3>How to Switch Models</h3>
+        <p>
+            Click "Activate Model" to switch strategies. This will update your .env file with the new parameters.
+            The bot will need to be restarted for changes to take effect. Commission costs are based on $1.00/order ($2.00 round-trip).
+        </p>
+    </div>
+
+    <script>
+        function activateModel(modelKey) {{
+            if (confirm('Switch to ' + modelKey + ' strategy? Bot restart required for changes.')) {{
+                fetch('/api/models/activate/' + modelKey, {{ method: 'POST' }})
+                    .then(r => r.json())
+                    .then(data => {{
+                        if (data.success) {{
+                            alert('Model activated! Restart the bot to apply changes.');
+                            location.reload();
+                        }} else {{
+                            alert('Error: ' + data.error);
+                        }}
+                    }});
+            }}
+        }}
+    </script>
+</body>
+</html>
+'''
+
+
+@app.post("/api/models/activate/{model_key}")
+async def activate_model(model_key: str):
+    import json
+    import os
+
+    models_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'models.json')
+    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
+
+    try:
+        with open(models_path, 'r') as f:
+            models_data = json.load(f)
+
+        if model_key not in models_data.get("models", {}):
+            return {"success": False, "error": "Model not found"}
+
+        # Update active model
+        models_data["active_model"] = model_key
+
+        # Update status flags
+        for key in models_data["models"]:
+            models_data["models"][key]["status"] = "active" if key == model_key else "saved"
+
+        with open(models_path, 'w') as f:
+            json.dump(models_data, f, indent=2)
+
+        # Update .env with new strategy type
+        model = models_data["models"][model_key]
+        params = model.get("parameters", {})
+
+        # Read current .env
+        with open(env_path, 'r') as f:
+            env_content = f.read()
+
+        # Update STRATEGY_TYPE
+        import re
+        env_content = re.sub(r'STRATEGY_TYPE=.*', f'STRATEGY_TYPE={model_key}', env_content)
+
+        with open(env_path, 'w') as f:
+            f.write(env_content)
+
+        return {"success": True, "model": model_key}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 @app.get("/api/stocks")
 async def get_stocks():
-    return read_state_file()
+    import asyncio
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, read_state_file)
 
 
 @app.get("/api/health")
