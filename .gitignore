@@ -15,4 +15,5 @@ logs/
 # Data
 data/*.db
 data/*.json
+data/*.tmp
 !data/.gitkeep
