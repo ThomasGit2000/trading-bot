@@ -1,0 +1,119 @@
+{
+  "models": {
+    "BREAKOUT": {
+      "name": "Breakout Strategy",
+      "description": "Price breakout detection - buys when price breaks above range high, sells below range low",
+      "status": "active",
+      "parameters": {
+        "BREAKOUT_LOOKBACK": 60,
+        "BREAKOUT_THRESHOLD": 0.002,
+        "ATR_FILTER": true,
+        "ATR_MIN_THRESHOLD": 0.001,
+        "STOP_LOSS_PCT": 0.05,
+        "TRAILING_STOP_PCT": 0.03,
+        "MIN_HOLD_PERIODS": 5
+      },
+      "backtest_results": {
+        "note": "High frequency on tick data - commission heavy"
+      }
+    },
+    "RSI_SWING": {
+      "name": "RSI Swing Strategy",
+      "description": "Buy oversold (RSI<20), sell overbought (RSI>70) - lower frequency, higher conviction",
+      "status": "saved",
+      "parameters": {
+        "RSI_PERIOD": 21,
+        "RSI_OVERSOLD": 20,
+        "RSI_OVERBOUGHT": 70,
+        "STOP_LOSS_PCT": 0.08,
+        "PROFIT_TARGET_PCT": 0.10,
+        "BAR_SIZE": 50
+      },
+      "backtest_results": {
+        "net_return": 0.54,
+        "gross_return": 0.57,
+        "win_rate": 59.7,
+        "trades": 67,
+        "commission": 134,
+        "period": "5 days",
+        "stocks": 66
+      }
+    },
+    "BOLLINGER": {
+      "name": "Bollinger Bounce",
+      "description": "Buy at lower band (3 std), sell at mean - mean reversion with volatility bands",
+      "status": "saved",
+      "parameters": {
+        "BB_PERIOD": 30,
+        "BB_STD": 3.0,
+        "STOP_LOSS_PCT": 0.05,
+        "PROFIT_TARGET_PCT": 0.05,
+        "BAR_SIZE": 50
+      },
+      "backtest_results": {
+        "net_return": -0.06,
+        "gross_return": 0.62,
+        "win_rate": 92.4,
+        "trades": 2321,
+        "commission": 4642,
+        "note": "92% win rate but commission kills profit"
+      }
+    },
+    "MACD": {
+      "name": "MACD Crossover",
+      "description": "Classic trend following - buy on MACD cross above signal, sell on cross below",
+      "status": "saved",
+      "parameters": {
+        "MACD_FAST": 12,
+        "MACD_SLOW": 26,
+        "MACD_SIGNAL": 9,
+        "STOP_LOSS_PCT": 0.05,
+        "PROFIT_TARGET_PCT": 0.10
+      },
+      "backtest_results": {
+        "note": "Classic momentum strategy"
+      }
+    },
+    "DONCHIAN": {
+      "name": "Donchian Breakout (Turtle)",
+      "description": "Turtle Trading method - buy on channel breakout, hold for X periods",
+      "status": "saved",
+      "parameters": {
+        "DONCHIAN_PERIOD": 20,
+        "STOP_LOSS_PCT": 0.05,
+        "PROFIT_TARGET_PCT": 0.15,
+        "HOLD_PERIODS": 100
+      },
+      "backtest_results": {
+        "note": "Trend following with hold periods"
+      }
+    },
+    "ALPHA_ENGINE": {
+      "name": "Alpha Engine (Confluence Filter)",
+      "description": "Combines 6 alpha signals (breakout, volume, ATR, RSI, regime, sentiment) with weighted scoring. Filters trades that don't meet confluence threshold.",
+      "status": "active",
+      "parameters": {
+        "ALPHA_ENGINE_ENABLED": true,
+        "ALPHA_THRESHOLD": 0.30,
+        "ALPHA_RSI_MAX": 70,
+        "ALPHA_VOLUME_MIN": 0,
+        "ALPHA_WEIGHT_BREAKOUT": 0.35,
+        "ALPHA_WEIGHT_VOLUME": 0.20,
+        "ALPHA_WEIGHT_ATR": 0.12,
+        "ALPHA_WEIGHT_RSI": 0.12,
+        "ALPHA_WEIGHT_REGIME": 0.11,
+        "ALPHA_WEIGHT_SENTIMENT": 0.10
+      },
+      "backtest_results": {
+        "net_return": 1.40,
+        "win_rate": 65.0,
+        "trades": 20,
+        "max_drawdown": 1.95,
+        "period": "7 days",
+        "stocks": 70,
+        "note": "vs baseline: +0.32% return, +10.5% win rate, -0.87% drawdown"
+      }
+    }
+  },
+  "active_model": "ALPHA_ENGINE"
+}

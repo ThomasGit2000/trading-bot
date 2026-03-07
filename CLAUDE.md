@@ -2,11 +2,12 @@
 
 ## Overview
 Automated multi-stock trading bot for Interactive Brokers.
-Uses **AGGRESSIVE MA(8/21) Fibonacci strategy** - backtested 74.6% win rate.
+Uses **BREAKOUT strategy** optimized for 1-second tick data.
 Now supports **70 momentum stocks** with intelligent news sentiment analysis.
 
-## Current State (Last updated: 2026-03-02)
-- **Strategy**: AGGRESSIVE MA(8/21) Fibonacci - 21.17% return, 74.6% win rate (1-year backtest)
+## Current State (Last updated: 2026-03-07)
+- **Strategy**: BREAKOUT with Alpha Engine (confluence filtering)
+- **Active Model**: ALPHA_ENGINE (see models.json)
 - **Stock Universe**: 70 hand-picked momentum stocks
 - **News Analysis**: VADER sentiment (industry-standard NLP)
 - **Risk Controls**: 5% stop-loss, 3% trailing stop, circuit breakers
@@ -31,34 +32,73 @@ Currently trading 70 momentum stocks across multiple sectors:
 - **Materials/Energy**: LIN, FCX, XOM, CVX, ENPH
 - **Other**: BABA, TMUS, ORLY, DHI, PGR
 
-## Strategy: AGGRESSIVE MA(8/21) Fibonacci
+## Strategy: BREAKOUT
 
-**Fibonacci-based moving averages** - tested and proven effective.
+**Price breakout detection** optimized for 1-second tick data.
 
 ### Entry/Exit Rules:
-- **BUY Signal**: MA(8) crosses **0.8% above** MA(21)
-- **SELL Signal**: MA(8) crosses **0.8% below** MA(21)
+- **BUY Signal**: Price breaks **0.5% above** 60-period high
+- **SELL Signal**: Price breaks **0.5% below** 60-period low (or stop-loss/trailing stop triggers)
+- **ATR Filter**: Only trades when ATR > 0.20% (filters low volatility)
 
 ### Risk Management (ACTIVE):
 - **5% Stop-Loss**: Cuts losses at -5% per trade
-- **3% Trailing Stop**: Locks in profits after 8% gain
-- **Minimum Hold**: 5 periods (5 seconds)
-
-### Quality Filters (ACTIVE):
-- **RSI Filter**: No entry if RSI > 70 (overbought)
-- **Volume Filter**: Requires 1.2x average volume for entry
-- **Minimum Volume**: Blocks trades on < 0.3x average volume
+- **3% Trailing Stop**: Locks in profits after gains
+- **Minimum Hold**: 5 periods
 
 ### Circuit Breakers:
 - **Max Daily Loss**: $1,000 (14% of account)
 - **Max Daily Trades**: 100 trades
 
-### Backtest Performance:
-- **Period**: 1 year (10 stocks, 2025-2026)
-- **Average Return**: 21.17%
-- **Win Rate**: 74.6%
-- **Average Trades**: 6.7 per stock
-- **Comparison**: Beats buy & hold significantly
+## Models System
+
+Trading strategies are stored in `models.json` and viewable at http://localhost:8080/models
+
+### models.json Structure
+```json
+{
+  "models": {
+    "MODEL_KEY": {
+      "name": "Human readable name",
+      "description": "What the model does",
+      "status": "active|saved",
+      "parameters": { ... },
+      "backtest_results": { ... }
+    }
+  },
+  "active_model": "MODEL_KEY"
+}
+```
+
+### Current Models
+| Model | Description | Status |
+|-------|-------------|--------|
+| **ALPHA_ENGINE** | 6-signal confluence filter (breakout, volume, ATR, RSI, regime, sentiment) | Active |
+| **BREAKOUT** | Raw price breakout detection | Saved |
+| **RSI_SWING** | Buy oversold, sell overbought | Saved |
+| **BOLLINGER** | Mean reversion at bands | Saved |
+| **MACD** | Classic trend following | Saved |
+| **DONCHIAN** | Turtle trading method | Saved |
+
+### Adding New Models
+1. Add model entry to `models.json` with parameters and backtest results
+2. If model needs new code, create in `src/` (e.g., `src/alpha_engine.py`)
+3. Integrate into `multi_bot.py` (import, build context, apply to signals)
+4. Add config to `.env` if needed
+5. Update dashboard column in `src/multi_dashboard.py` if displaying new data
+
+### Alpha Engine (Current Active Model)
+Combines 6 weighted signals for confluence-based filtering:
+- **Breakout** (0.35): Distance from range midpoint
+- **Volume** (0.20): Relative volume confirmation
+- **ATR** (0.12): Volatility momentum
+- **RSI** (0.12): Oversold/overbought levels
+- **Regime** (0.11): BULL/BEAR market detection
+- **Sentiment** (0.10): VADER news score
+
+**Scoring**: alpha_score >= 0.30 required for BUY
+**Hard Filters**: RSI < 70 (blocks overbought entries)
+**Backtest**: 65% win rate, +1.40% return (vs 54.5% baseline)
 
 ## News Sentiment Analysis
 
@@ -78,11 +118,12 @@ SYMBOLS=AAPL,MSFT,GOOGL,META,NVDA,AMD,AVGO,QCOM,TSM,ASML,MU,ARM,PLTR,AI,SNOW,DDO
 
 ### Strategy Settings
 ```bash
-# MA(8/21) Fibonacci Strategy
-STRATEGY_TYPE=AGGRESSIVE
-SHORT_MA=8
-LONG_MA=21
-MA_THRESHOLD=0.008  # 0.8% crossover threshold
+# BREAKOUT Strategy
+STRATEGY_TYPE=BREAKOUT
+BREAKOUT_LOOKBACK=60        # 60-period range for breakout detection
+BREAKOUT_THRESHOLD=0.005    # 0.5% above/below range
+ATR_FILTER=true             # Filter low volatility
+ATR_MIN_THRESHOLD=0.002    # Minimum 0.20% ATR
 
 # Speed Optimizations
 PRICE_INTERVAL_SEC=1   # Price updates every 1 second
@@ -93,12 +134,20 @@ STOP_LOSS_PCT=0.05          # 5% maximum loss per trade
 TRAILING_STOP_PCT=0.03      # 3% trailing stop from peak
 MIN_HOLD_PERIODS=5          # Minimum 5 bars hold
 
-# Filters (ENABLED)
-RSI_FILTER=true
-RSI_OVERBOUGHT=70
-VOLUME_FILTER=true
-VOLUME_CONFIRM_THRESHOLD=1.2
-VOLUME_MIN_THRESHOLD=0.3
+# Filters (DISABLED for BREAKOUT)
+RSI_FILTER=false
+VOLUME_FILTER=false
+
+# Alpha Engine (Confluence Filter)
+ALPHA_ENGINE_ENABLED=true
+ALPHA_THRESHOLD=0.30         # Minimum score for BUY
+ALPHA_RSI_MAX=70             # Block if RSI >= 70
+ALPHA_WEIGHT_BREAKOUT=0.35
+ALPHA_WEIGHT_VOLUME=0.20
+ALPHA_WEIGHT_ATR=0.12
+ALPHA_WEIGHT_RSI=0.12
+ALPHA_WEIGHT_REGIME=0.11
+ALPHA_WEIGHT_SENTIMENT=0.10
 ```
 
 ### Position Sizes
@@ -141,23 +190,26 @@ cd C:\ClaudeSpace\trading-bot && python multi_bot.py
 - **24H**: Sparkline chart
 - **Pos**: Current position (shares held)
 - **Target**: Target position size
-- **Data**: Price bars collected (X/21)
+- **Data**: Price bars collected (X/60)
 - **Signal**: BUY/SELL/HOLD with visual bar
-- **MA(8)**: Short-term moving average
-- **MA(21)**: Long-term moving average
+- **Range High**: 60-period high (breakout level)
+- **Range Low**: 60-period low (breakdown level)
 - **News**: Sentiment bar (red=negative, green=positive)
 
 ## Project Structure
 ```
 trading-bot/
 ├── multi_bot.py                   # Multi-stock trading bot
+├── models.json                    # Trading models/strategies config
 ├── simple_backtest.py             # Strategy backtesting script
+├── backtest_alpha_realistic.py    # Alpha engine backtest with portfolio sim
 ├── .env                           # Configuration file
 ├── CLAUDE.md                      # This file
 ├── SENTIMENT_UPGRADE.md           # VADER sentiment documentation
 ├── OPTIMIZATION_CHANGELOG.md      # Full changelog of optimizations
 ├── src/
-│   ├── strategy.py                # MA(8/21) strategy logic
+│   ├── alpha_engine.py            # Alpha confluence filter (6 signals)
+│   ├── strategy.py                # Breakout/MA strategy logic
 │   ├── multi_dashboard.py         # FastAPI dashboard server
 │   ├── yfinance_client.py         # Yahoo Finance + VADER sentiment
 │   ├── regime_detector.py         # Market regime detection (SPY)
@@ -168,17 +220,12 @@ trading-bot/
 
 ## Performance Summary
 
-### Before Optimizations:
-- Win Rate: 14%
-- Max Loss: Unlimited
-- Sentiment: All neutral (broken)
-
-### After Optimizations:
-- **Win Rate**: 74.6%
-- **Max Loss/Trade**: $36 (5%)
-- **Max Daily Loss**: $1,000 (14%)
-- **Sentiment**: VADER-powered, accurate
-- **Signal Latency**: 1.1-1.5s (50% faster)
+### Risk Controls:
+- **Max Loss/Trade**: 5% (stop-loss)
+- **Max Daily Loss**: $1,000 (circuit breaker)
+- **Trailing Stop**: 3% from peak
+- **ATR Filter**: 0.20% minimum volatility
+- **Sentiment**: VADER-powered news analysis
 
 ## Risk Management
 
@@ -206,12 +253,12 @@ trading-bot/
 - Updates hourly for all stocks
 - See SENTIMENT_UPGRADE.md for details
 
-### MA(8/21) Strategy
-- Fibonacci-based moving averages
-- 0.8% threshold for signal generation
-- Faster response than MA(10/30)
-- Backtested with 74.6% win rate
-- Optimized for momentum stocks
+### BREAKOUT Strategy
+- 60-period price range detection
+- 0.5% threshold for breakout confirmation
+- ATR filter ensures sufficient volatility
+- Optimized for 1-second tick data
+- Captures momentum breakouts
 
 ### Dynamic Order Pricing
 - Strong signals: Pay 0.3% premium (ensure fill)
@@ -268,15 +315,14 @@ git push origin master
 
 ### When Bot Trades:
 - Market hours only (9:30 AM - 4:00 PM ET)
-- MA(8) crosses MA(21) by ±0.8%
-- Volume confirms at 1.2x+ average
-- RSI not overbought (< 70)
+- Price breaks 0.5% above 60-period high (BUY)
+- Price breaks 0.5% below 60-period low (SELL)
+- ATR > 0.20% (sufficient volatility)
 
 ### When Bot Doesn't Trade:
 - Market closed (after-hours, weekends, holidays)
-- No clear MA crossover signal
-- Volume too low (< 1.2x)
-- RSI overbought (> 70)
+- Price within consolidation range
+- ATR too low (< 0.20% - low volatility)
 - Daily loss limit reached ($1,000)
 - Daily trade limit reached (100 trades)
 
@@ -284,8 +330,8 @@ git push origin master
 
 **GitHub**: https://github.com/ThomasGit2000/trading-bot
 
-**Last Updated**: 2026-03-02
+**Last Updated**: 2026-03-07 (Alpha Engine added)
 
 ---
 
-**Status**: ✅ Ready to trade - MA(8/21) AGGRESSIVE strategy active with VADER sentiment
+**Status**: ✅ Ready to trade - Alpha Engine active (65% win rate, confluence filtering)
