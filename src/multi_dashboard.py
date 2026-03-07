@@ -314,6 +314,7 @@ DASHBOARD_HTML = """
                 <th>ATR</th>
                 <th>StopOut</th>
                 <th class="sortable" data-sort="signal" onclick="sortTable('signal')">Signal <span class="sort-arrow"></span></th>
+                <th class="sortable" data-sort="alpha_score" onclick="sortTable('alpha_score')">Alpha <span class="sort-arrow"></span></th>
                 <th id="col-short" class="sortable" data-sort="short_ma" onclick="sortTable('short_ma')">Range Hi <span class="sort-arrow"></span></th>
                 <th id="col-long" class="sortable" data-sort="long_ma" onclick="sortTable('long_ma')">Range Lo <span class="sort-arrow"></span></th>
                 <th class="sortable" data-sort="rsi" onclick="sortTable('rsi')">RSI <span class="sort-arrow"></span></th>
@@ -321,7 +322,7 @@ DASHBOARD_HTML = """
             </tr>
         </thead>
         <tbody id="stocks-body">
-            <tr><td colspan="17" style="text-align:center;color:#8b949e;">Loading...</td></tr>
+            <tr><td colspan="18" style="text-align:center;color:#8b949e;">Loading...</td></tr>
         </tbody>
     </table>
 
@@ -826,7 +827,8 @@ DASHBOARD_HTML = """
         function createRow(s, rowNum) {
             const hasPos = s.position > 0;
             const sigPos = ((s.signal_strength || 0) + 100) / 200 * 100;
-            const newsScore = getNewsSentiment(s.news);
+            // Use pre-calculated news_sentiment if available, otherwise calculate from news
+            const newsScore = s.news_sentiment !== undefined ? s.news_sentiment : getNewsSentiment(s.news);
             const newsPos = ((newsScore + 100) / 200) * 100;
 
             let sigClass = 'signal-hold';
@@ -883,6 +885,7 @@ DASHBOARD_HTML = """
                         <span class="signal-label ${sigClass}">${s.signal || 'WAIT'}</span>
                         <div class="signal-bar"><div class="signal-indicator" style="left:${sigPos}%"></div></div>
                     </td>
+                    <td>${formatAlphaScore(s.alpha_score)}</td>
                     <td class="ma-val ma-short">$${s.short_ma?.toFixed(2) || '--'}</td>
                     <td class="ma-val ma-long">$${s.long_ma?.toFixed(2) || '--'}</td>
                     <td class="ma-val" style="color:${(s.rsi || 50) > 70 ? '#f85149' : (s.rsi || 50) < 30 ? '#3fb950' : '#8b949e'};">${s.rsi?.toFixed(1) || '50.0'}</td>
@@ -891,6 +894,26 @@ DASHBOARD_HTML = """
                     </td>
                 </tr>
             `;
+        }
+
+        function formatAlphaScore(score) {
+            if (score === undefined || score === null) {
+                return '<span style="color:#8b949e;">--</span>';
+            }
+
+            // Color based on thresholds: red (<-0.3), yellow (-0.3 to 0.3), green (>0.3)
+            let color;
+            if (score >= 0.30) {
+                color = '#3fb950';  // Green - bullish
+            } else if (score <= -0.30) {
+                color = '#f85149';  // Red - bearish
+            } else {
+                color = '#f0883e';  // Yellow/Orange - neutral
+            }
+
+            // Format as signed percentage with one decimal
+            const sign = score >= 0 ? '+' : '';
+            return `<span style="color:${color};font-weight:600;">${sign}${(score * 100).toFixed(0)}%</span>`;
         }
 
         function formatEventDays(events) {
@@ -2261,6 +2284,20 @@ MARKET_HOURS_HTML = """
 """
 
 
+def sanitize_floats(obj):
+    """Replace NaN and Infinity with None to make JSON-serializable"""
+    import math
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    elif isinstance(obj, dict):
+        return {k: sanitize_floats(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_floats(item) for item in obj]
+    return obj
+
+
 def read_state_file():
     """Read state from JSON file (written by bot process)"""
     import os
@@ -2268,7 +2305,8 @@ def read_state_file():
     try:
         with open(state_file, 'r', encoding='utf-8') as f:
             content = f.read()
-        return json.loads(content)
+        data = json.loads(content)
+        return sanitize_floats(data)  # Clean NaN/Inf values
     except (FileNotFoundError, json.JSONDecodeError, IOError) as e:
         # Fall back to in-memory state if file not available
         return bot_state.get_state()

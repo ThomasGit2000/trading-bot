@@ -13,12 +13,13 @@ import subprocess
 from datetime import datetime
 from dotenv import load_dotenv
 from ib_insync import IB, Stock, LimitOrder, util
-from src.strategy import SimpleStrategy
+from src.strategy import SimpleStrategy, BreakoutStrategy
 from src.dashboard_state import bot_state
 from src.regime_detector import RegimeDetector, AdaptiveStrategy
 from src.trade_verifier import trade_verifier, TradeStatus
 from src.trading_control import trading_control
 from src.yfinance_client import YFinanceClient
+from src.alpha_engine import alpha_engine, AlphaContext
 
 # Import stock universe for category support
 try:
@@ -51,22 +52,37 @@ load_dotenv()
 class StockTrader:
     """Manages trading for a single stock"""
 
-    def __init__(self, symbol: str, position_size: int, short_ma: int, long_ma: int, threshold: float = 0.003, category: str = "UNCATEGORIZED", volume_filter: bool = False, rsi_period: int = 14):
+    def __init__(self, symbol: str, position_size: int, short_ma: int, long_ma: int, threshold: float = 0.003, category: str = "UNCATEGORIZED", volume_filter: bool = False, rsi_period: int = 14, strategy_type: str = "MA_CROSSOVER", breakout_lookback: int = 60, breakout_threshold: float = 0.005, stop_loss_pct: float = 0.05, trailing_stop_pct: float = 0.03, atr_filter: bool = False, atr_min_threshold: float = 0.003, atr_period: int = 300):
         self.symbol = symbol
         self.position_size = position_size
         self.category = category
         self.threshold = threshold
-        self.strategy = SimpleStrategy(
-            short_window=short_ma,
-            long_window=long_ma,
-            threshold=threshold,
-            stop_loss_pct=None,  # NO STOPS
-            trailing_stop_pct=None,  # NO STOPS
-            min_hold_periods=0,
-            volume_confirm_threshold=1.5 if volume_filter else 0,  # Disable volume filter if not enabled
-            volume_min_threshold=0.5 if volume_filter else 0,
-            rsi_period=rsi_period
-        )
+        self.strategy_type = strategy_type
+
+        if strategy_type == "BREAKOUT":
+            self.strategy = BreakoutStrategy(
+                lookback_periods=breakout_lookback,
+                breakout_threshold=breakout_threshold,
+                stop_loss_pct=stop_loss_pct,
+                trailing_stop_pct=trailing_stop_pct,
+                trail_after_profit_pct=0.01,
+                min_hold_periods=10,
+                atr_filter=atr_filter,
+                atr_min_threshold=atr_min_threshold,
+                atr_period=atr_period
+            )
+        else:  # MA_CROSSOVER (default)
+            self.strategy = SimpleStrategy(
+                short_window=short_ma,
+                long_window=long_ma,
+                threshold=threshold,
+                stop_loss_pct=stop_loss_pct,
+                trailing_stop_pct=trailing_stop_pct,
+                min_hold_periods=5,
+                volume_confirm_threshold=1.5 if volume_filter else 0,
+                volume_min_threshold=0.5 if volume_filter else 0,
+                rsi_period=rsi_period
+            )
         self.contract = Stock(symbol, 'SMART', 'USD')
         self.position = 0
         self.last_price = 0
@@ -83,27 +99,66 @@ class StockTrader:
         self.intraday_prices = []
         self.last_intraday_update = 0
 
-    def get_state(self) -> dict:
-        """Get current state for dashboard"""
+    def get_state(self, lightweight: bool = False) -> dict:
+        """Get current state for dashboard. Use lightweight=True for WebSocket updates."""
         short_ma = 0
         long_ma = 0
         signal = "WAIT"
         signal_strength = 0
         rsi = 50  # Default RSI
 
-        if len(self.strategy.prices) >= self.strategy.short_window:
-            short_ma = sum(list(self.strategy.prices)[-self.strategy.short_window:]) / self.strategy.short_window
-        if len(self.strategy.prices) >= self.strategy.long_window:
-            long_ma = sum(list(self.strategy.prices)[-self.strategy.long_window:]) / self.strategy.long_window
-            signal = self.strategy.get_signal()
+        if self.strategy_type == "BREAKOUT":
+            # Breakout strategy
+            if len(self.strategy.prices) >= self.strategy.lookback_periods:
+                signal = self.strategy.get_signal()
+                signal_strength = self.strategy.get_signal_strength()
+                range_high, range_low = self.strategy.get_range()
+                short_ma = range_high or 0  # Show range high as "short_ma"
+                long_ma = range_low or 0    # Show range low as "long_ma"
+        else:
+            # MA Crossover strategy
+            if len(self.strategy.prices) >= self.strategy.short_window:
+                short_ma = sum(list(self.strategy.prices)[-self.strategy.short_window:]) / self.strategy.short_window
+            if len(self.strategy.prices) >= self.strategy.long_window:
+                long_ma = sum(list(self.strategy.prices)[-self.strategy.long_window:]) / self.strategy.long_window
+                signal = self.strategy.get_signal()
+                signal_strength, _ = self._calculate_probability(short_ma, long_ma)
+            rsi = self.strategy.get_current_rsi()
 
-            # Calculate signal strength (-100 to +100)
-            signal_strength, _ = self._calculate_probability(short_ma, long_ma)
+        # Determine filter status and stop-out state
+        vol_ok = True  # Default OK
+        atr_ok = True
+        atr_pct = 0
+        stop_out = None  # None, 'TRAIL', or 'LOSS'
 
-        # Get current RSI
-        rsi = self.strategy.get_current_rsi()
+        if self.strategy_type == "BREAKOUT":
+            # Check ATR filter for breakout strategy
+            raw_atr = self.strategy.get_atr_percent()
+            atr_pct = raw_atr  # Store as decimal (0.02 = 2%)
+            if hasattr(self.strategy, 'atr_filter') and self.strategy.atr_filter:
+                atr_ok = atr_pct >= self.strategy.atr_min_threshold  # Compare decimals
+            # Check stop-out status
+            if signal == 'STOP_LOSS':
+                stop_out = 'LOSS'
+            elif signal == 'TRAILING_STOP':
+                stop_out = 'TRAIL'
+        else:
+            # Check volume filter for MA strategy
+            if hasattr(self.strategy, 'volume_confirm_threshold') and self.strategy.volume_confirm_threshold > 0:
+                vol_ok = self.strategy.check_volume_confirmation()
+            if signal == 'STOP_LOSS':
+                stop_out = 'LOSS'
+            elif signal == 'TRAILING_STOP':
+                stop_out = 'TRAIL'
 
-        return {
+        # Compute alpha score if enabled
+        alpha_score = 0.0
+        if alpha_engine.enabled and self.strategy_type == "BREAKOUT":
+            alpha_context = self._build_alpha_context(rsi, atr_pct, "UNKNOWN")
+            alpha_result = alpha_engine.compute_alpha(alpha_context)
+            alpha_score = alpha_result['score']
+
+        state = {
             'symbol': self.symbol,
             'category': self.category,
             'price': self.last_price,
@@ -121,9 +176,21 @@ class StockTrader:
             'in_position': self.strategy.in_position,
             'signal_strength': signal_strength,
             'upcoming_events': self.upcoming_events,
-            'news': self.news,
-            'price_history': self.intraday_prices[-50:] if self.intraday_prices else []
+            'vol_ok': vol_ok,
+            'atr_ok': atr_ok,
+            'atr_pct': atr_pct,
+            'stop_out': stop_out,
+            'news_sentiment': self._get_news_sentiment(),  # Lightweight sentiment score
+            'alpha_score': alpha_score,  # Alpha engine composite score
         }
+
+        # Only include heavy data for full state requests (not WebSocket)
+        if not lightweight:
+            state['news'] = self.news
+            state['price_history'] = self.intraday_prices[-50:] if self.intraday_prices else []
+            state['tick_prices'] = list(self.strategy.prices)[-60:] if self.strategy.prices else []
+
+        return state
 
     def _calculate_probability(self, short_ma: float, long_ma: float) -> tuple:
         """
@@ -161,6 +228,44 @@ class StockTrader:
             signal = (position * 200) - 100  # Scale 0-1 to -100 to +100
 
         return (round(signal, 1), 0)
+
+    def _get_news_sentiment(self) -> float:
+        """Calculate average sentiment score from news (-100 to +100)"""
+        if not self.news:
+            return 0
+        scores = [n.get('sentiment_score', 0) for n in self.news if isinstance(n, dict)]
+        if not scores:
+            return 0
+        avg = sum(scores) / len(scores)
+        return round(avg * 100, 1)  # Scale -1..+1 to -100..+100
+
+    def _build_alpha_context(self, rsi: float = 50.0, atr_pct: float = 0.0, regime: str = "UNKNOWN") -> AlphaContext:
+        """Build context for alpha engine computation"""
+        # Get strategy context
+        strategy_ctx = {}
+        if hasattr(self.strategy, 'get_alpha_context'):
+            strategy_ctx = self.strategy.get_alpha_context()
+
+        # Get relative volume (default 1.0 if not available)
+        relative_volume = 1.0
+        if hasattr(self.strategy, 'get_relative_volume'):
+            relative_volume = self.strategy.get_relative_volume()
+
+        # Get news sentiment (-1 to +1 scale)
+        news_sentiment = self._get_news_sentiment() / 100.0  # Convert back to -1..+1
+
+        return AlphaContext(
+            prices=strategy_ctx.get('prices', list(self.strategy.prices)),
+            current_price=self.last_price,
+            range_high=strategy_ctx.get('range_high'),
+            range_low=strategy_ctx.get('range_low'),
+            rsi=rsi,
+            atr_pct=atr_pct,
+            relative_volume=relative_volume,
+            regime=regime,
+            news_sentiment=news_sentiment,
+            in_position=self.strategy.in_position,
+        )
 
 
 class MultiStockBot:
@@ -224,11 +329,19 @@ class MultiStockBot:
             self.position_sizes = {}
 
         # Strategy settings
+        self.strategy_type = os.getenv('STRATEGY_TYPE', 'MA_CROSSOVER').upper()
         self.short_ma = int(os.getenv('SHORT_MA', '10'))
         self.long_ma = int(os.getenv('LONG_MA', '30'))
         self.ma_threshold = float(os.getenv('MA_THRESHOLD', '0.003'))
+        self.breakout_lookback = int(os.getenv('BREAKOUT_LOOKBACK', '60'))
+        self.breakout_threshold = float(os.getenv('BREAKOUT_THRESHOLD', '0.005'))
+        self.atr_filter = os.getenv('ATR_FILTER', 'false').lower() == 'true'
+        self.atr_min_threshold = float(os.getenv('ATR_MIN_THRESHOLD', '0.003'))
+        self.atr_period = int(os.getenv('ATR_PERIOD', '300'))  # 5 min smoothing
         self.rsi_period = int(os.getenv('RSI_PERIOD', '14'))
         self.volume_filter = os.getenv('VOLUME_FILTER', 'false').lower() == 'true'
+        self.stop_loss_pct = float(os.getenv('STOP_LOSS_PCT', '0.05'))
+        self.trailing_stop_pct = float(os.getenv('TRAILING_STOP_PCT', '0.03'))
 
         # Bot settings
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
@@ -287,7 +400,15 @@ class MultiStockBot:
                 threshold=self.ma_threshold,
                 category=category,
                 volume_filter=self.volume_filter,
-                rsi_period=self.rsi_period
+                rsi_period=self.rsi_period,
+                strategy_type=self.strategy_type,
+                breakout_lookback=self.breakout_lookback,
+                breakout_threshold=self.breakout_threshold,
+                stop_loss_pct=self.stop_loss_pct,
+                trailing_stop_pct=self.trailing_stop_pct,
+                atr_filter=self.atr_filter,
+                atr_min_threshold=self.atr_min_threshold,
+                atr_period=self.atr_period
             )
             logger.info(f"Created trader for {symbol} [{category}] (size: {pos_size})")
 
@@ -299,7 +420,11 @@ class MultiStockBot:
 
         mode = "DRY RUN" if self.dry_run else "LIVE TRADING"
         logger.info(f"Multi-Stock Bot initialized - Symbols: {self.symbols}, Mode: {mode}")
-        logger.info(f"Strategy: MA({self.short_ma}/{self.long_ma}) threshold={self.ma_threshold*100:.1f}%, RSI({self.rsi_period})")
+        if self.strategy_type == "BREAKOUT":
+            atr_status = f", ATR>{self.atr_min_threshold*100:.1f}%" if self.atr_filter else ""
+            logger.info(f"Strategy: BREAKOUT (lookback={self.breakout_lookback}, threshold={self.breakout_threshold*100:.2f}%{atr_status})")
+        else:
+            logger.info(f"Strategy: MA({self.short_ma}/{self.long_ma}) threshold={self.ma_threshold*100:.1f}%, RSI({self.rsi_period})")
 
     def preload_historical_data(self):
         """Pre-load historical prices from IBKR so MAs have meaningful values at startup"""
@@ -396,6 +521,15 @@ class MultiStockBot:
 
     def disconnect(self):
         """Disconnect from IB and cancel market data subscriptions"""
+        # Stop dashboard subprocess if running
+        if hasattr(self, 'dashboard_process') and self.dashboard_process:
+            try:
+                self.dashboard_process.terminate()
+                self.dashboard_process.wait(timeout=3)
+                logger.info("Dashboard process stopped")
+            except Exception:
+                pass
+
         if self.ib.isConnected():
             # Cancel all market data subscriptions
             for symbol, ticker in self.tickers.items():
@@ -521,13 +655,8 @@ class MultiStockBot:
             logger.info(f"[TRADING DISABLED] {action} {quantity} {trader.symbol} @ ${price:.2f} - Order skipped")
             return False
 
-        # Check if market is open
-        if not self.is_market_open():
-            trade_verifier.record_skipped(
-                trader.symbol, action, quantity, price, "Market closed"
-            )
-            logger.info(f"[MARKET CLOSED] {action} {quantity} {trader.symbol} @ ${price:.2f} - Order skipped")
-            return False
+        # Market hours check removed - ATR filter handles low-volatility periods
+        # Trading allowed 24/7, ATR >= 0.20% requirement filters out dead markets
 
         # Reset daily counters at start of new day
         today = datetime.now().date()
@@ -614,22 +743,11 @@ class MultiStockBot:
             else:
                 signal_strength = 0.01  # Default for weak signal
 
-            # Strong signals: pay up to ensure fill
-            # Weak signals: be patient with better pricing
+            # Always pay premium to ensure fill
             if action == 'BUY':
-                if signal_strength > 0.03:  # Very strong signal (>3% MA separation)
-                    limit_price = round(price * 1.003, 2)  # Pay 0.3% premium
-                elif signal_strength > 0.015:  # Medium signal
-                    limit_price = round(price * 1.001, 2)  # Pay 0.1% premium
-                else:  # Weak signal
-                    limit_price = round(price * 0.999, 2)  # Wait for 0.1% discount
+                limit_price = round(price * 1.0002, 2)  # Pay 0.02% premium - ensure fill
             else:  # SELL
-                if signal_strength > 0.03:  # Very strong sell signal
-                    limit_price = round(price * 0.997, 2)  # Accept 0.3% discount to exit fast
-                elif signal_strength > 0.015:  # Medium signal
-                    limit_price = round(price * 0.999, 2)  # Accept 0.1% discount
-                else:  # Weak signal
-                    limit_price = round(price * 1.001, 2)  # Try for 0.1% premium
+                limit_price = round(price * 0.9998, 2)  # Accept 0.02% discount - ensure fill
 
             order = LimitOrder(action, quantity, limit_price)
             ib_trade = self.ib.placeOrder(trader.contract, order)
@@ -753,7 +871,7 @@ class MultiStockBot:
             logger.info(f"Updated news with VADER sentiment for {news_updated} stocks (YFinance)")
 
     def check_signals(self):
-        """Check trading signals for all stocks with regime awareness"""
+        """Check trading signals for all stocks with regime awareness and alpha engine"""
         # Get current market regime
         regime = 'UNKNOWN'
         if self.regime_detector:
@@ -764,8 +882,14 @@ class MultiStockBot:
                 logger.warning("Not connected to IB")
                 continue
 
-            if len(trader.strategy.prices) < trader.strategy.long_window:
-                logger.info(f"{symbol}: Collecting data ({len(trader.strategy.prices)}/{trader.strategy.long_window})")
+            # Check minimum data requirement (depends on strategy type)
+            if trader.strategy_type == "BREAKOUT":
+                min_data = trader.strategy.lookback_periods
+            else:
+                min_data = trader.strategy.long_window
+
+            if len(trader.strategy.prices) < min_data:
+                logger.info(f"{symbol}: Collecting data ({len(trader.strategy.prices)}/{min_data})")
                 continue
 
             trader.position = self.get_position(trader)
@@ -773,11 +897,34 @@ class MultiStockBot:
 
             # Apply regime-aware logic if enabled
             if self.adaptive_strategy and regime != 'UNKNOWN':
-                action = self.adaptive_strategy.get_action(symbol, stock_signal, int(trader.position))
+                regime_action = self.adaptive_strategy.get_action(symbol, stock_signal, int(trader.position))
             else:
-                action = stock_signal
+                regime_action = stock_signal
 
-            logger.info(f"{symbol}: ${trader.last_price:.2f} | Pos: {trader.position} | Signal: {stock_signal} | Regime: {regime} | Action: {action}")
+            # Apply alpha engine for BREAKOUT strategy
+            action = regime_action
+            alpha_score = 0.0
+            alpha_signal = 'N/A'
+
+            if alpha_engine.enabled and trader.strategy_type == "BREAKOUT":
+                # Get RSI and ATR for alpha context
+                rsi = 50.0
+                if hasattr(trader.strategy, 'get_current_rsi'):
+                    rsi = trader.strategy.get_current_rsi()
+                atr_pct = trader.strategy.get_atr_percent()
+
+                # Build alpha context and compute score
+                alpha_context = trader._build_alpha_context(rsi, atr_pct, regime)
+                alpha_result = alpha_engine.compute_alpha(alpha_context)
+                alpha_score = alpha_result['score']
+                alpha_signal = alpha_result['signal']
+
+                # Get final action from alpha engine
+                action = alpha_engine.get_action_for_signal(alpha_result, regime_action, int(trader.position))
+
+                logger.info(f"{symbol}: ${trader.last_price:.2f} | Pos: {trader.position} | Signal: {stock_signal} | Alpha: {alpha_score:+.2f} ({alpha_signal}) | Regime: {regime} | Action: {action}")
+            else:
+                logger.info(f"{symbol}: ${trader.last_price:.2f} | Pos: {trader.position} | Signal: {stock_signal} | Regime: {regime} | Action: {action}")
 
             # Sync strategy state with actual position
             if trader.position > 0 and not trader.strategy.in_position:
@@ -785,26 +932,36 @@ class MultiStockBot:
             elif trader.position == 0 and trader.strategy.in_position:
                 trader.strategy.exit_position("Closed externally")
 
-            # Execute trades based on regime-aware action
+            # Execute trades based on alpha-aware action
             if action == 'BUY' and trader.position == 0:
-                logger.info(f"{symbol}: BUY SIGNAL [{regime}] - Opening position")
+                if alpha_engine.enabled:
+                    logger.info(f"{symbol}: BUY SIGNAL [Alpha: {alpha_score:+.2f}, {regime}] - Opening position")
+                else:
+                    logger.info(f"{symbol}: BUY SIGNAL [{regime}] - Opening position")
                 if self.place_order(trader, 'BUY', trader.position_size):
                     trader.strategy.enter_position(trader.last_price)
 
             elif action == 'SELL' and trader.position > 0:
                 sell_qty = min(int(trader.position), trader.position_size)
-                logger.info(f"{symbol}: SELL SIGNAL [{regime}] - Closing position")
+                if alpha_engine.enabled:
+                    logger.info(f"{symbol}: SELL SIGNAL [Alpha: {alpha_score:+.2f}, {regime}] - Closing position")
+                else:
+                    logger.info(f"{symbol}: SELL SIGNAL [{regime}] - Closing position")
                 if self.place_order(trader, 'SELL', sell_qty):
-                    trader.strategy.exit_position(f"MA crossover ({regime} market)")
+                    exit_reason = "Breakout breakdown" if trader.strategy_type == "BREAKOUT" else "MA crossover"
+                    trader.strategy.exit_position(f"{exit_reason} ({regime} market)")
+
+            elif regime_action == 'BUY' and action == 'HOLD' and trader.position == 0:
+                logger.info(f"{symbol}: BUY blocked - Alpha {alpha_score:+.2f} < {alpha_engine.threshold}")
 
             elif stock_signal == 'SELL' and action == 'HOLD' and trader.position > 0:
                 logger.info(f"{symbol}: SELL signal IGNORED - BULL market, holding position")
 
     def update_dashboard(self):
-        """Update dashboard with all stock states"""
+        """Update dashboard with all stock states (lightweight for performance)"""
         states = []
         for symbol, trader in self.traders.items():
-            states.append(trader.get_state())
+            states.append(trader.get_state(lightweight=True))  # Skip chart data for WebSocket
 
         # Include regime state
         regime_state = None
@@ -824,7 +981,11 @@ class MultiStockBot:
             'trading_control': trading_control.get_state(),
             'net_liquidation_dkk': round(self.net_liquidation_usd, 2),  # IB values are already in DKK
             'excess_liquidity_dkk': round(self.available_cash_usd, 2),  # IB values are already in DKK
-            'available_cash_usd': round(self.available_cash_usd, 2)
+            'available_cash_usd': round(self.available_cash_usd, 2),
+            'strategy_type': self.strategy_type,
+            'data_requirement': self.breakout_lookback if self.strategy_type == "BREAKOUT" else self.long_ma,
+            'alpha_engine_enabled': alpha_engine.enabled,
+            'alpha_threshold': alpha_engine.threshold if alpha_engine.enabled else 0.30
         }
 
         # Update in-memory state (for backward compat)
@@ -834,12 +995,12 @@ class MultiStockBot:
         try:
             import json
             state_file = os.path.join(os.path.dirname(__file__), 'data', 'bot_state.json')
-            logger.info(f"Writing state to: {state_file}")
-            with open(state_file, 'w') as f:
+            os.makedirs(os.path.dirname(state_file), exist_ok=True)
+            # Direct write (simpler, avoids Windows file locking issues with rename)
+            with open(state_file, 'w', encoding='utf-8') as f:
                 json.dump(state_data, f)
-            logger.info(f"State file written successfully ({len(state_data.get('stocks', []))} stocks)")
         except Exception as e:
-            logger.error(f"Failed to write state file to {state_file}: {e}")
+            logger.error(f"Failed to write state file: {e}")
 
     def start(self):
         """Start the trading bot"""
@@ -865,16 +1026,16 @@ class MultiStockBot:
         # Initial cash balance check
         self.update_cash_balance()
 
-        # Start dashboard in thread
+        # Start dashboard as subprocess (separate process for better responsiveness)
         if self.enable_dashboard:
-            from src.multi_dashboard import run_multi_dashboard
-            dashboard_thread = threading.Thread(
-                target=run_multi_dashboard,
-                kwargs={'host': '0.0.0.0', 'port': self.dashboard_port},
-                daemon=True
+            import sys
+            # Use -m to run as module so imports work correctly
+            self.dashboard_process = subprocess.Popen(
+                [sys.executable, '-m', 'src.multi_dashboard'],
+                cwd=os.path.dirname(__file__)
             )
-            dashboard_thread.start()
-            logger.info(f"Dashboard started at http://localhost:{self.dashboard_port}")
+            time.sleep(1)  # Give dashboard time to start
+            logger.info(f"Dashboard started at http://localhost:{self.dashboard_port} (PID: {self.dashboard_process.pid})")
 
         logger.info(f"Collecting prices every {self.price_interval}s, checking trades every {self.trade_interval}s")
 

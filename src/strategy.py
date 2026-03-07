@@ -468,3 +468,231 @@ class SimpleStrategy:
             'earnings_signal_strength': self.earnings_signal_strength,
             'earnings_signal_reason': self.earnings_signal_reason,
         }
+
+
+class BreakoutStrategy:
+    """
+    Breakout strategy optimized for 1-second tick data.
+
+    Logic:
+    - Track rolling high/low over N periods (default 60 = 1 minute)
+    - BUY when price breaks above the high by breakout_threshold
+    - SELL when price breaks below the low by breakout_threshold
+    - Stop-loss and trailing stop for risk management
+    """
+
+    def __init__(self, lookback_periods=60, breakout_threshold=0.002,
+                 stop_loss_pct=0.05, trailing_stop_pct=0.03,
+                 trail_after_profit_pct=0.01, min_hold_periods=10,
+                 atr_filter=False, atr_min_threshold=0.003, atr_period=300):
+        # Breakout parameters
+        self.lookback_periods = lookback_periods  # 60 ticks = 1 minute
+        self.breakout_threshold = breakout_threshold  # 0.5% breakout required
+
+        # Risk management
+        self.stop_loss_pct = stop_loss_pct
+        self.trailing_stop_pct = trailing_stop_pct
+        self.trail_after_profit_pct = trail_after_profit_pct
+        self.min_hold_periods = min_hold_periods
+
+        # ATR volatility filter (smoothed over longer period)
+        self.atr_filter = atr_filter
+        self.atr_min_threshold = atr_min_threshold  # Min ATR% to trade
+        self.atr_period = atr_period  # 300 ticks = 5 minutes (smooths volatility)
+        self.smoothed_atr = None  # EMA of ATR for stability
+
+        # State
+        self.prices = []
+        self.in_position = False
+        self.entry_price = 0
+        self.peak_price = 0
+        self.periods_held = 0
+
+    def add_price(self, price: float):
+        """Add a new price tick"""
+        self.prices.append(price)
+        # Keep enough for ATR calculation (longer than breakout lookback)
+        max_needed = max(self.lookback_periods, self.atr_period) + 10
+        if len(self.prices) > max_needed:
+            self.prices = self.prices[-max_needed:]
+
+        if self.in_position:
+            self.periods_held += 1
+            if price > self.peak_price:
+                self.peak_price = price
+
+    def get_range(self):
+        """Get high/low over lookback period"""
+        if len(self.prices) < self.lookback_periods:
+            return None, None
+        window = self.prices[-self.lookback_periods:-1]  # Exclude current price
+        return max(window), min(window)
+
+    def get_atr_percent(self) -> float:
+        """
+        Calculate volatility as percentage of price using the price range.
+        Uses the high-low range over the lookback period (60 ticks).
+        Higher range = more volatile = better for breakout trading.
+        """
+        # Need enough data - use lookback_periods (60 ticks)
+        if len(self.prices) < self.lookback_periods:
+            return 0
+
+        # Use the lookback window (same as breakout detection)
+        window = self.prices[-self.lookback_periods:]
+        current_price = window[-1]
+
+        if current_price <= 0:
+            return 0
+
+        # Calculate range as percentage of current price
+        range_high = max(window)
+        range_low = min(window)
+        price_range = range_high - range_low
+
+        # ATR = range / price (as decimal, e.g., 0.02 = 2%)
+        atr_pct = price_range / current_price
+
+        return atr_pct
+
+    def check_stop_loss(self, current_price: float) -> bool:
+        """Check if stop-loss triggered"""
+        if not self.in_position or self.entry_price <= 0:
+            return False
+        loss_pct = (self.entry_price - current_price) / self.entry_price
+        return loss_pct >= self.stop_loss_pct
+
+    def check_trailing_stop(self, current_price: float) -> bool:
+        """Check if trailing stop triggered"""
+        if not self.in_position or self.peak_price <= 0:
+            return False
+        # Only activate after minimum profit
+        profit_pct = (self.peak_price - self.entry_price) / self.entry_price
+        if profit_pct < self.trail_after_profit_pct:
+            return False
+        drop_pct = (self.peak_price - current_price) / self.peak_price
+        return drop_pct >= self.trailing_stop_pct
+
+    def enter_position(self, price: float):
+        """Record entry"""
+        self.in_position = True
+        self.entry_price = price
+        self.peak_price = price
+        self.periods_held = 0
+
+    def exit_position(self):
+        """Record exit"""
+        self.in_position = False
+        self.entry_price = 0
+        self.peak_price = 0
+        self.periods_held = 0
+
+    def get_signal(self) -> str:
+        """
+        Generate trading signal based on breakout logic.
+
+        Returns: 'BUY', 'SELL', 'STOP_LOSS', 'TRAILING_STOP', or 'HOLD'
+        """
+        if len(self.prices) < self.lookback_periods:
+            return 'HOLD'  # Not enough data
+
+        current_price = self.prices[-1]
+        range_high, range_low = self.get_range()
+
+        if range_high is None:
+            return 'HOLD'
+
+        # If in position, check exits first
+        if self.in_position:
+            # Stop-loss
+            if self.check_stop_loss(current_price):
+                logger.info(f"STOP-LOSS: ${current_price:.2f} (entry: ${self.entry_price:.2f})")
+                return 'STOP_LOSS'
+
+            # Trailing stop (after min hold)
+            if self.periods_held >= self.min_hold_periods:
+                if self.check_trailing_stop(current_price):
+                    logger.info(f"TRAILING STOP: ${current_price:.2f} (peak: ${self.peak_price:.2f})")
+                    return 'TRAILING_STOP'
+
+            # Breakout down - SELL signal
+            breakout_low = range_low * (1 - self.breakout_threshold)
+            if current_price < breakout_low and self.periods_held >= self.min_hold_periods:
+                logger.info(f"BREAKOUT DOWN: ${current_price:.2f} < ${breakout_low:.2f}")
+                return 'SELL'
+
+        # Not in position - check for BUY
+        else:
+            breakout_high = range_high * (1 + self.breakout_threshold)
+            if current_price > breakout_high:
+                # Check ATR filter if enabled
+                if self.atr_filter:
+                    atr_pct = self.get_atr_percent()
+                    if atr_pct < self.atr_min_threshold:
+                        logger.debug(f"ATR FILTER: {atr_pct*100:.3f}% < {self.atr_min_threshold*100:.3f}% - skipping")
+                        return 'HOLD'
+                    logger.info(f"BREAKOUT UP: ${current_price:.2f} > ${breakout_high:.2f} (ATR: {atr_pct*100:.2f}%)")
+                else:
+                    logger.info(f"BREAKOUT UP: ${current_price:.2f} > ${breakout_high:.2f}")
+                return 'BUY'
+
+        return 'HOLD'
+
+    def get_signal_strength(self) -> float:
+        """Calculate signal strength based on breakout magnitude"""
+        if len(self.prices) < self.lookback_periods:
+            return 0
+
+        current_price = self.prices[-1]
+        range_high, range_low = self.get_range()
+
+        if range_high is None or range_high == range_low:
+            return 0
+
+        # Signal strength = how far beyond the range
+        range_size = range_high - range_low
+        mid_point = (range_high + range_low) / 2
+        deviation = (current_price - mid_point) / range_size * 100
+
+        return deviation  # Positive = bullish, negative = bearish
+
+    def get_alpha_context(self) -> dict:
+        """
+        Get context data needed for alpha engine computation.
+
+        Returns:
+            dict with prices, current_price, range_high, range_low, atr_pct, in_position
+        """
+        current_price = self.prices[-1] if self.prices else 0
+        range_high, range_low = self.get_range()
+        atr_pct = self.get_atr_percent()
+
+        return {
+            'prices': list(self.prices),
+            'current_price': current_price,
+            'range_high': range_high,
+            'range_low': range_low,
+            'atr_pct': atr_pct,
+            'in_position': self.in_position,
+        }
+
+    def get_state(self, current_volume: float = 0) -> dict:
+        """Get current strategy state"""
+        current_price = self.prices[-1] if self.prices else 0
+        range_high, range_low = self.get_range()
+
+        return {
+            'in_position': self.in_position,
+            'entry_price': self.entry_price,
+            'peak_price': self.peak_price,
+            'periods_held': self.periods_held,
+            'current_price': current_price,
+            'range_high': range_high or 0,
+            'range_low': range_low or 0,
+            'breakout_up_price': range_high * (1 + self.breakout_threshold) if range_high else 0,
+            'breakout_down_price': range_low * (1 - self.breakout_threshold) if range_low else 0,
+            'unrealized_pnl': (current_price - self.entry_price) if self.in_position else 0,
+            'unrealized_pnl_pct': ((current_price - self.entry_price) / self.entry_price * 100) if self.in_position and self.entry_price > 0 else 0,
+            'stop_loss_price': self.entry_price * (1 - self.stop_loss_pct) if self.in_position else 0,
+            'trailing_stop_price': self.peak_price * (1 - self.trailing_stop_pct) if self.in_position else 0,
+        }
