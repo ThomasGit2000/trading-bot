@@ -41,7 +41,7 @@ class TradingControl:
         self._load_state()
 
     def _load_state(self):
-        """Load state from file"""
+        """Load state from file (silent - no logging to avoid spam)"""
         try:
             if os.path.exists(STATE_FILE):
                 with open(STATE_FILE, 'r') as f:
@@ -49,7 +49,6 @@ class TradingControl:
                     self._enabled = data.get('enabled', False)
                     self._last_changed = data.get('last_changed')
                     self._changed_by = data.get('changed_by')
-                    logger.info(f"Trading control loaded: {'ENABLED' if self._enabled else 'DISABLED'}")
         except Exception as e:
             logger.error(f"Failed to load trading control state: {e}")
             self._enabled = False  # Default to safe state
@@ -68,7 +67,8 @@ class TradingControl:
             logger.error(f"Failed to save trading control state: {e}")
 
     def is_enabled(self) -> bool:
-        """Check if trading is enabled"""
+        """Check if trading is enabled (reloads from file for cross-process sync)"""
+        self._load_state()  # Reload to pick up changes from dashboard
         return self._enabled
 
     def enable(self, by: str = "dashboard"):
@@ -101,7 +101,8 @@ class TradingControl:
             return self._enabled
 
     def get_state(self) -> dict:
-        """Get full state for dashboard"""
+        """Get full state for dashboard (reloads from file for cross-process sync)"""
+        self._load_state()  # Reload to pick up changes from dashboard
         return {
             'enabled': self._enabled,
             'last_changed': self._last_changed,

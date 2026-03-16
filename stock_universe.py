@@ -352,6 +352,13 @@ STOCK_CATEGORIES = {
             "MLM", "VMC", "CX", "EXP", "SUM", "USLM", "ROCK", "IBP",
             "BLD", "BLDR", "BECN", "GMS", "TILE", "TREX", "AZEK"
         ]
+    },
+
+    "GLOBAL_INDEX_ETF": {
+        "description": "Global/World index ETFs",
+        "symbols": [
+            "URTH", "VT", "ACWI", "VEU", "VXUS", "EFA", "IEFA"
+        ]
     }
 }
 
@@ -420,11 +427,70 @@ CATEGORY_POSITION_SIZES = {
     "TELECOM": 40,
     "MEDIA_ENTERTAINMENT": 20,
     "HOMEBUILDERS": 20,
-    "BUILDING_MATERIALS": 25
+    "BUILDING_MATERIALS": 25,
+    "GLOBAL_INDEX_ETF": 0  # Monitor only by default
+}
+
+# Symbol-specific overrides (takes precedence over category)
+SYMBOL_POSITION_OVERRIDES = {
+    "URTH": 0,   # MSCI World ETF - monitor only, no trading
+    # Position limits: 1/5 of 50,000 DKK = ~$1,429 USD max per position
+    # Very expensive (>$700) - max 1-2 shares
+    "ASML": 1,   # ~$1377
+    "COST": 1,   # ~$1001
+    "LLY": 1,    # ~$986
+    "GS": 1,     # ~$794
+    "CAT": 2,    # ~$700
+    "LMT": 2,    # ~$643
+    # Expensive ($400-700) - max 2-3 shares
+    "META": 2,   # ~$624
+    "MA": 2,     # ~$503
+    "LIN": 2,    # ~$495
+    "ISRG": 2,   # ~$481
+    "MU": 3,     # ~$447
+    "CRWD": 3,   # ~$427
+    # Mid-expensive ($300-400) - max 3-4 shares
+    "MSFT": 3,   # ~$399
+    "TSLA": 3,   # ~$398
+    "TSM": 4,    # ~$343
+    "HD": 4,     # ~$343
+    "AVGO": 4,   # ~$328
+    "MCD": 4,    # ~$327
+    "V": 4,      # ~$308
+    "GOOGL": 4,  # ~$305
+    "GE": 4,     # ~$304
+    "CEG": 4,    # ~$304
+    "UNH": 4,    # ~$287
+    # Mid-range ($200-300) - max 5-7 shares
+    "JPM": 5,    # ~$285
+    "ADBE": 5,   # ~$254
+    "AAPL": 5,   # ~$252
+    "HON": 6,    # ~$235
+    "ABBV": 6,   # ~$222
+    "TMUS": 6,   # ~$214
+    "BA": 6,     # ~$214
+    "AMZN": 6,   # ~$211
+    "RTX": 6,    # ~$206
+    "PGR": 6,    # ~$205
+    "COIN": 6,   # ~$205
+    # Lower volatility overrides
+    "PLTR": 9,   # ~$152 - volatile
+    # Wide spread stocks - excluded from scalping (spread > 0.15%)
+    "ZS": 0,     # 0.12% spread - monitor only
+    "DHR": 0,    # 0.15% spread - monitor only
+    "SNOW": 0,   # 0.16% spread - monitor only
+    "BKNG": 0,   # 0.16% spread - monitor only
+    "BLK": 0,    # 0.18% spread - monitor only
+    "SPOT": 0,   # 0.20% spread - monitor only
+    "DDOG": 0,   # 0.24% spread - monitor only
+    "NET": 0,    # 0.24% spread - monitor only
 }
 
 def get_position_size(symbol):
     """Get recommended position size for a symbol based on its category"""
+    # Check for symbol-specific override first
+    if symbol in SYMBOL_POSITION_OVERRIDES:
+        return SYMBOL_POSITION_OVERRIDES[symbol]
     category = get_symbol_category(symbol)
     return CATEGORY_POSITION_SIZES.get(category, 20)
 

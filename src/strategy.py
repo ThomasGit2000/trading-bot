@@ -580,7 +580,7 @@ class BreakoutStrategy:
         self.peak_price = price
         self.periods_held = 0
 
-    def exit_position(self):
+    def exit_position(self, reason: str = ""):
         """Record exit"""
         self.in_position = False
         self.entry_price = 0
@@ -629,11 +629,8 @@ class BreakoutStrategy:
                 if self.atr_filter:
                     atr_pct = self.get_atr_percent()
                     if atr_pct < self.atr_min_threshold:
-                        logger.debug(f"ATR FILTER: {atr_pct*100:.3f}% < {self.atr_min_threshold*100:.3f}% - skipping")
-                        return 'HOLD'
-                    logger.info(f"BREAKOUT UP: ${current_price:.2f} > ${breakout_high:.2f} (ATR: {atr_pct*100:.2f}%)")
-                else:
-                    logger.info(f"BREAKOUT UP: ${current_price:.2f} > ${breakout_high:.2f}")
+                        return 'HOLD'  # Skip logging for ATR filter (too frequent in tick mode)
+                # Don't log here - logged at trade execution level to avoid spam in tick mode
                 return 'BUY'
 
         return 'HOLD'
@@ -675,6 +672,52 @@ class BreakoutStrategy:
             'atr_pct': atr_pct,
             'in_position': self.in_position,
         }
+
+    def get_current_rsi(self) -> float:
+        """Calculate RSI based on recent price changes."""
+        if len(self.prices) < 15:
+            return 50.0  # Default neutral RSI
+
+        # Use last 14 periods for RSI calculation
+        changes = [self.prices[i] - self.prices[i-1] for i in range(-14, 0)]
+        gains = [c for c in changes if c > 0]
+        losses = [-c for c in changes if c < 0]
+
+        avg_gain = sum(gains) / 14 if gains else 0
+        avg_loss = sum(losses) / 14 if losses else 0
+
+        if avg_loss == 0:
+            return 100.0 if avg_gain > 0 else 50.0
+
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+
+    def get_relative_volume(self) -> float:
+        """
+        Estimate relative volume based on price movement volatility.
+        Higher volatility suggests higher volume activity.
+        Returns a multiplier (1.0 = normal, 2.0 = double normal).
+        """
+        if len(self.prices) < self.lookback_periods:
+            return 1.0  # Default normal volume
+
+        # Use ATR as proxy for volume activity
+        atr_pct = self.get_atr_percent()
+
+        # Map ATR to relative volume:
+        # ATR < 0.1% -> 0.5x (low activity)
+        # ATR 0.1-0.3% -> 1.0x (normal)
+        # ATR 0.3-0.5% -> 1.5x (elevated)
+        # ATR > 0.5% -> 2.0x (high)
+        if atr_pct < 0.001:
+            return 0.5
+        elif atr_pct < 0.003:
+            return 1.0
+        elif atr_pct < 0.005:
+            return 1.5
+        else:
+            return 2.0
 
     def get_state(self, current_volume: float = 0) -> dict:
         """Get current strategy state"""

@@ -71,14 +71,14 @@ class MicroAlphaEngine:
     The composite score is the weighted sum of all signals.
     """
 
-    # Default weights (sum to 1.0)
+    # Default weights (sum to 1.0) - Optimized for 60% win rate
     DEFAULT_WEIGHTS = {
-        'breakout': 0.35,
+        'breakout': 0.50,
         'volume': 0.20,
-        'atr': 0.12,
-        'rsi': 0.12,
-        'regime': 0.11,
-        'sentiment': 0.10,
+        'atr': 0.10,
+        'rsi': 0.20,
+        'regime': 0.00,
+        'sentiment': 0.00,
     }
 
     # Thresholds for trading decisions
@@ -94,6 +94,10 @@ class MicroAlphaEngine:
         # Hard filters (block trades regardless of alpha score)
         self.rsi_max = float(os.getenv('ALPHA_RSI_MAX', '70'))  # Block if RSI >= this
         self.volume_min = float(os.getenv('ALPHA_VOLUME_MIN', '0'))  # Block if rel_vol < this
+
+        # Tick confirmation (require N consecutive BUY signals before executing)
+        self.confirm_ticks = int(os.getenv('ALPHA_CONFIRM_TICKS', '10'))  # 10 ticks = ~1 second
+        self._confirm_counts = {}  # symbol -> consecutive buy signal count
 
         # Load weights from environment or use defaults
         self.weights = {
@@ -113,6 +117,7 @@ class MicroAlphaEngine:
         if self.enabled:
             logger.info(f"Alpha Engine ENABLED - Threshold: {self.threshold}")
             logger.info(f"  Hard Filters: RSI < {self.rsi_max}, Volume > {self.volume_min}x")
+            logger.info(f"  Tick Confirmation: {self.confirm_ticks} consecutive ticks required")
             logger.info(f"  Weights: {self.weights}")
         else:
             logger.info("Alpha Engine DISABLED - Using raw breakout signals")
@@ -315,30 +320,30 @@ class MicroAlphaEngine:
 
     def compute_rsi_alpha(self, context: AlphaContext) -> AlphaResult:
         """
-        Compute RSI momentum alpha.
+        Compute RSI momentum alpha (optimized for 60% win rate).
 
-        RSI 30-40 = oversold = bullish (+0.5)
-        RSI 40-60 = neutral (0.0)
-        RSI 60-70 = slightly overbought (-0.2)
-        RSI >70 = overbought = bearish (-0.5)
-        RSI <30 = extremely oversold = very bullish (+0.8)
+        RSI <35 = very oversold = strong bullish (+0.8)
+        RSI 35-45 = slightly oversold = bullish (+0.4)
+        RSI 45-55 = neutral (0.0)
+        RSI 55-65 = slightly overbought (-0.3)
+        RSI >65 = overbought = bearish (-0.6)
         """
         rsi = context.rsi
 
-        if rsi < 30:
-            value = 0.8  # Extremely oversold - strong buy
+        if rsi < 35:
+            value = 0.8  # Very oversold - strong buy
             confidence = 0.9
-        elif rsi < 40:
-            value = 0.5  # Oversold - bullish
+        elif rsi < 45:
+            value = 0.4  # Slightly oversold - bullish
             confidence = 0.85
-        elif rsi <= 60:
+        elif rsi < 55:
             value = 0.0  # Neutral
             confidence = 0.7
-        elif rsi <= 70:
-            value = -0.2  # Slightly overbought
+        elif rsi < 65:
+            value = -0.3  # Slightly overbought
             confidence = 0.75
         else:
-            value = -0.5  # Overbought - bearish
+            value = -0.6  # Overbought - bearish
             confidence = 0.85
 
         return AlphaResult(
@@ -415,7 +420,7 @@ class MicroAlphaEngine:
 
         return f"Alpha {score:+.2f} -> {signal}: {', '.join(top_factors)}"
 
-    def get_action_for_signal(self, alpha_result: Dict, raw_signal: str, position: int) -> str:
+    def get_action_for_signal(self, alpha_result: Dict, raw_signal: str, position: int, symbol: str = None) -> str:
         """
         Determine trading action based on alpha score and raw signal.
 
@@ -423,6 +428,7 @@ class MicroAlphaEngine:
             alpha_result: Result from compute_alpha()
             raw_signal: Raw signal from strategy (BUY, SELL, HOLD, STOP_LOSS, etc.)
             position: Current position (0 = no position, >0 = long)
+            symbol: Stock symbol for tick confirmation tracking
 
         Returns:
             Action to take (BUY, SELL, HOLD)
@@ -440,25 +446,50 @@ class MicroAlphaEngine:
 
         # Stop-loss and trailing stop always execute (risk management)
         if raw_signal in ('STOP_LOSS', 'TRAILING_STOP'):
+            if symbol:
+                self._confirm_counts[symbol] = 0  # Reset confirmation
             return 'SELL'
 
-        # BUY logic: Need raw BUY signal AND alpha confirmation AND hard filters pass
-        if raw_signal == 'BUY' and position == 0:
+        # BUY logic: Alpha score >= threshold is enough to trigger BUY (no breakout needed)
+        if position == 0 and score >= self.threshold:
             # Check hard filters first
             if not hard_filter_passed:
+                if symbol:
+                    self._confirm_counts[symbol] = 0  # Reset confirmation
                 logger.info(f"BUY blocked by hard filter: {hard_filter_reason}")
                 return 'HOLD'
 
-            # Check alpha threshold
-            if score >= self.threshold:
-                logger.info(f"BUY confirmed: Alpha {score:.2f} >= {self.threshold}")
-                return 'BUY'
+            # Tick confirmation: require N consecutive BUY signals
+            if symbol and self.confirm_ticks > 1:
+                self._confirm_counts[symbol] = self._confirm_counts.get(symbol, 0) + 1
+                count = self._confirm_counts[symbol]
+
+                if count < self.confirm_ticks:
+                    # Still accumulating confirmation ticks
+                    if count == 1 or count % 5 == 0:  # Log first and every 5th
+                        logger.debug(f"{symbol}: BUY signal {count}/{self.confirm_ticks} (alpha {score:.2f})")
+                    return 'HOLD'
+                else:
+                    # Confirmed! Reset counter and execute
+                    self._confirm_counts[symbol] = 0
+                    logger.info(f"BUY CONFIRMED after {self.confirm_ticks} ticks: {symbol} alpha {score:.2f}")
+                    return 'BUY'
             else:
-                logger.info(f"BUY blocked: Alpha {score:.2f} < {self.threshold}")
-                return 'HOLD'
+                # No confirmation required or no symbol provided
+                if raw_signal == 'BUY':
+                    logger.info(f"BUY confirmed: Alpha {score:.2f} + Breakout")
+                else:
+                    logger.info(f"BUY initiated by alpha: {score:.2f} >= {self.threshold}")
+                return 'BUY'
+        else:
+            # Signal not strong enough - reset confirmation counter
+            if symbol:
+                self._confirm_counts[symbol] = 0
 
         # SELL logic: Either alpha says SELL or raw signal says SELL
         if raw_signal == 'SELL' and position > 0:
+            if symbol:
+                self._confirm_counts[symbol] = 0
             if score <= self.SELL_THRESHOLD:
                 logger.info(f"SELL confirmed: Alpha {score:.2f} <= {self.SELL_THRESHOLD}")
                 return 'SELL'
@@ -468,6 +499,8 @@ class MicroAlphaEngine:
 
         # Alpha-initiated SELL (even without raw SELL signal)
         if position > 0 and score <= self.SELL_THRESHOLD:
+            if symbol:
+                self._confirm_counts[symbol] = 0
             logger.info(f"SELL initiated by alpha: {score:.2f}")
             return 'SELL'
 

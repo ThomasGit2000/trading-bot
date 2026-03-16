@@ -3,7 +3,7 @@
     "BREAKOUT": {
       "name": "Breakout Strategy",
       "description": "Price breakout detection - buys when price breaks above range high, sells below range low",
-      "status": "active",
+      "status": "saved",
       "parameters": {
         "BREAKOUT_LOOKBACK": 60,
         "BREAKOUT_THRESHOLD": 0.002,
@@ -91,7 +91,7 @@
     "ALPHA_ENGINE": {
       "name": "Alpha Engine (Confluence Filter)",
       "description": "Combines 6 alpha signals (breakout, volume, ATR, RSI, regime, sentiment) with weighted scoring. Filters trades that don't meet confluence threshold.",
-      "status": "active",
+      "status": "saved",
       "parameters": {
         "ALPHA_ENGINE_ENABLED": true,
         "ALPHA_THRESHOLD": 0.30,
@@ -113,7 +113,44 @@
         "stocks": 70,
         "note": "vs baseline: +0.32% return, +10.5% win rate, -0.87% drawdown"
       }
+    },
+    "SCALP_ML_V1": {
+      "name": "Scalp ML (LightGBM)",
+      "description": "ML scalping with 12 orderbook/tick features, 30s prediction horizon. Entry: 0.04%, TP: 0.07%, SL: 0.04%, Max hold: 60s",
+      "status": "saved",
+      "parameters": {
+        "STRATEGY_TYPE": "SCALP_ML",
+        "SCALP_MODEL_PATH": "models/scalp_lgbm_v1.txt",
+        "SCALP_ENTRY_THRESHOLD": 0.0004,
+        "SCALP_TAKE_PROFIT": 0.0007,
+        "SCALP_STOP_LOSS": 0.0004,
+        "SCALP_MAX_HOLD_SEC": 60,
+        "features": ["return_5s", "return_10s", "return_30s", "orderbook_imbalance",
+                     "weighted_imbalance", "microprice_diff", "queue_ratio", "spread",
+                     "volume_ratio", "trade_rate", "vwap_distance", "volatility_10s"]
+      },
+      "backtest_results": {
+        "note": "Requires training - run train_scalp_model.py after collecting tick data"
+      }
+    },
+    "SCALP_TICK": {
+      "name": "Tick Scalper (Mean Reversion)",
+      "description": "Fast momentum scalping on tick data. Buys dips (0.20% drop in 20 ticks), targets 0.18%, stops at 0.12%. Max hold 50 ticks.",
+      "status": "active",
+      "parameters": {
+        "STRATEGY_TYPE": "SCALP_TICK",
+        "SCALP_STRATEGY": "MEAN_REVERSION",
+        "SCALP_LOOKBACK_TICKS": 20,
+        "SCALP_ENTRY_PCT": 0.20,
+        "SCALP_TARGET_PCT": 0.18,
+        "SCALP_STOP_PCT": 0.12,
+        "SCALP_MAX_HOLD_TICKS": 50,
+        "SCALP_COOLDOWN_TICKS": 30
+      },
+      "backtest_results": {
+        "note": "Live testing in progress"
+      }
     }
   },
-  "active_model": "ALPHA_ENGINE"
+  "active_model": "SCALP_TICK"
 }

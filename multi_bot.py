@@ -5,21 +5,32 @@ Supports categorized stock universe for organized trading.
 """
 import os
 import sys
+import csv
 import json
 import time
 import logging
 import threading
 import subprocess
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from dotenv import load_dotenv
+
+# Load .env BEFORE importing modules that read environment variables
+load_dotenv()
+
 from ib_insync import IB, Stock, LimitOrder, util
 from src.strategy import SimpleStrategy, BreakoutStrategy
+from src.scalp_ml_strategy import ScalpMLStrategy
 from src.dashboard_state import bot_state
 from src.regime_detector import RegimeDetector, AdaptiveStrategy
 from src.trade_verifier import trade_verifier, TradeStatus
 from src.trading_control import trading_control
 from src.yfinance_client import YFinanceClient
 from src.alpha_engine import alpha_engine, AlphaContext
+from src.health_monitor import health_monitor
+from src.activity_logger import activity_logger
+from src.tick_scalper import tick_scalper
 
 # Import stock universe for category support
 try:
@@ -35,6 +46,9 @@ try:
 except ImportError:
     UNIVERSE_AVAILABLE = False
 
+# Minimum position value in USD (to ensure commissions don't eat profits)
+MIN_POSITION_VALUE_USD = float(os.getenv('MIN_POSITION_VALUE_USD', '1000'))
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -46,7 +60,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-load_dotenv()
+
+# ============================================================================
+# MULTIPROCESSING WORKER FUNCTIONS (must be module-level for pickle)
+# ============================================================================
+
+def _compute_alpha_worker(args):
+    """
+    Worker function for parallel alpha computation.
+    Runs in separate process to utilize multiple CPU cores.
+
+    Args: tuple of (symbol, alpha_context_dict, strategy_signal, position, regime)
+    Returns: tuple of (symbol, alpha_score, action)
+    """
+    symbol, context_dict, strategy_signal, position, regime = args
+    try:
+        # Import here to ensure fresh module load in worker process
+        from src.alpha_engine import alpha_engine, AlphaContext
+
+        # Reconstruct context
+        context = AlphaContext(**context_dict)
+
+        # Compute alpha
+        result = alpha_engine.compute_alpha(context)
+        alpha_score = result['score']
+
+        # Get action (pass symbol for tick confirmation tracking)
+        action = alpha_engine.get_action_for_signal(result, strategy_signal, position, symbol)
+
+        return (symbol, alpha_score, action)
+    except Exception as e:
+        # Return HOLD on error
+        return (symbol, 0.0, 'HOLD')
 
 
 class StockTrader:
@@ -59,7 +104,25 @@ class StockTrader:
         self.threshold = threshold
         self.strategy_type = strategy_type
 
-        if strategy_type == "BREAKOUT":
+        if strategy_type == "SCALP_ML":
+            self.strategy = ScalpMLStrategy(
+                model_path=os.getenv('SCALP_MODEL_PATH', 'models/scalp_lgbm_v1.txt'),
+                entry_threshold=float(os.getenv('SCALP_ENTRY_THRESHOLD', 0.0004)),
+                take_profit=float(os.getenv('SCALP_TAKE_PROFIT', 0.0007)),
+                stop_loss=float(os.getenv('SCALP_STOP_LOSS', 0.0004)),
+                max_hold_seconds=int(os.getenv('SCALP_MAX_HOLD_SEC', 60))
+            )
+        elif strategy_type == "SCALP_TICK":
+            # Tick scalper uses tick_scalper singleton, no separate strategy object
+            # Use a simple breakout strategy as placeholder for warmup/data collection
+            self.strategy = BreakoutStrategy(
+                lookback_periods=20,  # Minimal lookback for warmup
+                breakout_threshold=0.01,  # Won't be used
+                stop_loss_pct=0.001,
+                trailing_stop_pct=0.001
+            )
+            self.warmup_required = 25  # Quick warmup for scalping
+        elif strategy_type == "BREAKOUT":
             self.strategy = BreakoutStrategy(
                 lookback_periods=breakout_lookback,
                 breakout_threshold=breakout_threshold,
@@ -88,6 +151,11 @@ class StockTrader:
         self.last_price = 0
         self.last_bid = 0
         self.last_ask = 0
+
+        # Track real-time ticks separately from preloaded historical data
+        # This ensures we have fresh intraday data before trading
+        self.realtime_ticks = 0
+        self.warmup_required = breakout_lookback if strategy_type == "BREAKOUT" else long_ma
         self.previous_close = 0
         self.ticker = None
         self.data_source = 'UNKNOWN'
@@ -98,8 +166,10 @@ class StockTrader:
         # 24H intraday prices for sparkline
         self.intraday_prices = []
         self.last_intraday_update = 0
+        # Beta vs MSCI World (URTH)
+        self.beta = None
 
-    def get_state(self, lightweight: bool = False) -> dict:
+    def get_state(self, lightweight: bool = False, regime: str = "UNKNOWN") -> dict:
         """Get current state for dashboard. Use lightweight=True for WebSocket updates."""
         short_ma = 0
         long_ma = 0
@@ -107,15 +177,18 @@ class StockTrader:
         signal_strength = 0
         rsi = 50  # Default RSI
 
-        if self.strategy_type == "BREAKOUT":
-            # Breakout strategy
+        if self.strategy_type == "BREAKOUT" or self.strategy_type == "SCALP_TICK":
+            # Breakout or Scalp Tick strategy
             if len(self.strategy.prices) >= self.strategy.lookback_periods:
                 signal = self.strategy.get_signal()
                 signal_strength = self.strategy.get_signal_strength()
                 range_high, range_low = self.strategy.get_range()
                 short_ma = range_high or 0  # Show range high as "short_ma"
                 long_ma = range_low or 0    # Show range low as "long_ma"
-        else:
+            # Get RSI for breakout strategy too
+            if hasattr(self.strategy, 'get_current_rsi'):
+                rsi = self.strategy.get_current_rsi()
+        elif self.strategy_type == "MA_CROSSOVER":
             # MA Crossover strategy
             if len(self.strategy.prices) >= self.strategy.short_window:
                 short_ma = sum(list(self.strategy.prices)[-self.strategy.short_window:]) / self.strategy.short_window
@@ -131,8 +204,8 @@ class StockTrader:
         atr_pct = 0
         stop_out = None  # None, 'TRAIL', or 'LOSS'
 
-        if self.strategy_type == "BREAKOUT":
-            # Check ATR filter for breakout strategy
+        if self.strategy_type == "BREAKOUT" or self.strategy_type == "SCALP_TICK":
+            # Check ATR filter for breakout/scalp strategy
             raw_atr = self.strategy.get_atr_percent()
             atr_pct = raw_atr  # Store as decimal (0.02 = 2%)
             if hasattr(self.strategy, 'atr_filter') and self.strategy.atr_filter:
@@ -142,7 +215,7 @@ class StockTrader:
                 stop_out = 'LOSS'
             elif signal == 'TRAILING_STOP':
                 stop_out = 'TRAIL'
-        else:
+        elif self.strategy_type == "MA_CROSSOVER":
             # Check volume filter for MA strategy
             if hasattr(self.strategy, 'volume_confirm_threshold') and self.strategy.volume_confirm_threshold > 0:
                 vol_ok = self.strategy.check_volume_confirmation()
@@ -151,12 +224,16 @@ class StockTrader:
             elif signal == 'TRAILING_STOP':
                 stop_out = 'TRAIL'
 
-        # Compute alpha score if enabled
+        # Compute alpha score and components if enabled
         alpha_score = 0.0
+        alpha_components = {}
         if alpha_engine.enabled and self.strategy_type == "BREAKOUT":
-            alpha_context = self._build_alpha_context(rsi, atr_pct, "UNKNOWN")
+            alpha_context = self._build_alpha_context(rsi, atr_pct, regime)
             alpha_result = alpha_engine.compute_alpha(alpha_context)
             alpha_score = alpha_result['score']
+            # Extract individual component values for dashboard
+            for comp in alpha_result.get('components', []):
+                alpha_components[comp.name.lower()] = round(comp.value, 2)
 
         state = {
             'symbol': self.symbol,
@@ -172,6 +249,9 @@ class StockTrader:
             'rsi': rsi,
             'signal': signal,
             'prices_collected': len(self.strategy.prices),
+            'realtime_ticks': self.realtime_ticks,
+            'warmup_required': self.warmup_required,
+            'warmup_complete': self.realtime_ticks >= self.warmup_required,
             'data_source': self.data_source,
             'in_position': self.strategy.in_position,
             'signal_strength': signal_strength,
@@ -182,6 +262,9 @@ class StockTrader:
             'stop_out': stop_out,
             'news_sentiment': self._get_news_sentiment(),  # Lightweight sentiment score
             'alpha_score': alpha_score,  # Alpha engine composite score
+            'alpha_components': alpha_components,  # Individual signal values
+            'regime': regime,  # Market regime
+            'beta': self.beta,  # Beta vs MSCI World (URTH)
         }
 
         # Only include heavy data for full state requests (not WebSocket)
@@ -347,14 +430,37 @@ class MultiStockBot:
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
         self.price_interval = float(os.getenv('PRICE_INTERVAL_SEC', '5'))
         self.trade_interval = int(os.getenv('TRADE_INTERVAL_SEC', '60'))
+        self.tick_mode = os.getenv('TICK_MODE', 'false').lower() == 'true'
+        self.trade_cooldown_sec = int(os.getenv('TRADE_COOLDOWN_SEC', '60'))  # Min seconds between trades per stock
+        self.symbol_last_trade = {}  # symbol -> timestamp of last trade (for cooldown)
+        self.signal_throttle_sec = float(os.getenv('SIGNAL_THROTTLE_SEC', '0.1'))  # Min seconds between signal checks per stock
+        self.symbol_last_signal_check = {}  # symbol -> timestamp of last signal check
+
+        # Multi-core processing for parallel alpha computation
+        self.parallel_workers = int(os.getenv('PARALLEL_WORKERS', str(multiprocessing.cpu_count())))
+        self.use_multiprocessing = os.getenv('USE_MULTIPROCESSING', 'true').lower() == 'true'
+        self.process_pool = None  # Initialized in connect() after fork safety
+        self.pending_signal_batch = []  # Batch of signals to process in parallel
 
         # Dashboard
         self.enable_dashboard = os.getenv('ENABLE_DASHBOARD', 'true').lower() == 'true'
         self.dashboard_port = int(os.getenv('DASHBOARD_PORT', '8080'))
 
+        # Tick data collection (for ML training)
+        self.collect_tick_data = os.getenv('COLLECT_TICK_DATA', 'false').lower() == 'true'
+        self.tick_data_dir = os.path.join(os.path.dirname(__file__), 'data', 'ticks')
+        self.tick_writers = {}  # symbol -> csv.writer
+        self.tick_files = {}   # symbol -> file handle
+        self.tick_counts = {}  # symbol -> count
+        self.last_tick_flush = 0
+
         # IBKR streaming market data
         self.tickers = {}  # symbol -> Ticker object
         self.regime_ticker = None  # Ticker for regime index (SPY)
+
+        # Order tracking for timeout cancellation
+        self.pending_orders = {}  # order_id -> {'symbol': str, 'time': float, 'trade': Trade}
+        self.order_timeout_seconds = 30  # Cancel unfilled orders after 30 seconds
 
         # Regime detection (BULL/BEAR market awareness)
         self.regime_enabled = os.getenv('REGIME_AWARE', 'true').lower() == 'true'
@@ -423,6 +529,10 @@ class MultiStockBot:
         if self.strategy_type == "BREAKOUT":
             atr_status = f", ATR>{self.atr_min_threshold*100:.1f}%" if self.atr_filter else ""
             logger.info(f"Strategy: BREAKOUT (lookback={self.breakout_lookback}, threshold={self.breakout_threshold*100:.2f}%{atr_status})")
+        elif self.strategy_type == "SCALP_TICK":
+            logger.info(f"Strategy: SCALP_TICK (entry={os.getenv('SCALP_ENTRY_PCT', '0.15')}%, target={os.getenv('SCALP_TARGET_PCT', '0.08')}%, stop={os.getenv('SCALP_STOP_PCT', '0.10')}%)")
+        elif self.strategy_type == "SCALP_ML":
+            logger.info(f"Strategy: SCALP_ML (model={os.getenv('SCALP_MODEL_PATH', 'models/scalp_lgbm_v1.txt')})")
         else:
             logger.info(f"Strategy: MA({self.short_ma}/{self.long_ma}) threshold={self.ma_threshold*100:.1f}%, RSI({self.rsi_period})")
 
@@ -483,9 +593,165 @@ class MultiStockBot:
             except Exception as e:
                 logger.error(f"Failed to load regime historical data: {e}")
 
+    def adjust_position_sizes_for_min_value(self):
+        """Adjust position sizes to meet minimum USD value requirement"""
+        logger.info(f"Adjusting position sizes for minimum ${MIN_POSITION_VALUE_USD:.0f} value...")
+        adjusted = 0
+
+        for symbol, trader in self.traders.items():
+            if trader.position_size == 0:
+                continue  # Skip monitor-only stocks
+
+            price = trader.last_price
+            if price <= 0:
+                continue
+
+            current_value = trader.position_size * price
+
+            if current_value < MIN_POSITION_VALUE_USD:
+                # Calculate shares needed for minimum value
+                min_shares = int(MIN_POSITION_VALUE_USD / price) + 1
+                old_size = trader.position_size
+                trader.position_size = min_shares
+                adjusted += 1
+                logger.info(f"{symbol}: Adjusted {old_size} -> {min_shares} shares (${price:.2f} x {min_shares} = ${min_shares * price:.0f})")
+
+        if adjusted > 0:
+            logger.info(f"Adjusted {adjusted} position sizes to meet ${MIN_POSITION_VALUE_USD:.0f} minimum")
+        else:
+            logger.info(f"All position sizes already meet ${MIN_POSITION_VALUE_USD:.0f} minimum")
+
+    def init_tick_collection(self):
+        """Initialize tick data CSV files for ML training"""
+        if not self.collect_tick_data:
+            return
+
+        os.makedirs(self.tick_data_dir, exist_ok=True)
+        date_str = datetime.now().strftime("%Y%m%d")
+
+        for symbol in self.symbols:
+            filepath = os.path.join(self.tick_data_dir, f'{symbol}_{date_str}.csv')
+            file_exists = os.path.exists(filepath)
+            f = open(filepath, 'a', newline='')
+            writer = csv.writer(f)
+
+            if not file_exists:
+                writer.writerow([
+                    'timestamp', 'price', 'volume',
+                    'bid', 'ask', 'bid_size', 'ask_size',
+                    'bid2', 'ask2', 'bid2_size', 'ask2_size',
+                    'bid3', 'ask3', 'bid3_size', 'ask3_size'
+                ])
+
+            self.tick_files[symbol] = f
+            self.tick_writers[symbol] = writer
+            self.tick_counts[symbol] = 0
+
+        logger.info(f"Tick data collection ENABLED for {len(self.symbols)} symbols -> {self.tick_data_dir}")
+
+    def close_tick_files(self):
+        """Close all tick data CSV files"""
+        for symbol, f in self.tick_files.items():
+            try:
+                f.close()
+                logger.info(f"Saved tick data: {symbol} ({self.tick_counts.get(symbol, 0):,} ticks)")
+            except Exception:
+                pass
+        self.tick_files = {}
+        self.tick_writers = {}
+
+    def cancel_stale_orders(self):
+        """Cancel any open orders from previous sessions to start fresh"""
+        try:
+            open_orders = self.ib.openOrders()
+            if not open_orders:
+                logger.info("No stale orders to cancel")
+                return
+
+            cancelled_count = 0
+            for order in open_orders:
+                try:
+                    # Get the trade object for this order
+                    trades = [t for t in self.ib.openTrades() if t.order.orderId == order.orderId]
+                    if trades:
+                        trade = trades[0]
+                        symbol = trade.contract.symbol
+                        self.ib.cancelOrder(order)
+                        logger.warning(f"[STARTUP] Cancelled stale order: {order.action} {order.totalQuantity} {symbol} @ ${order.lmtPrice:.2f}")
+                        activity_logger.log_order_cancelled(symbol, order.action, int(order.totalQuantity), "Stale order from previous session", order.orderId)
+                        cancelled_count += 1
+                except Exception as e:
+                    logger.error(f"Failed to cancel order {order.orderId}: {e}")
+
+            if cancelled_count > 0:
+                logger.info(f"[STARTUP] Cancelled {cancelled_count} stale orders")
+                self.ib.sleep(1)  # Allow cancellations to process
+
+        except Exception as e:
+            logger.error(f"Error checking for stale orders: {e}")
+
+    def cancel_timed_out_orders(self):
+        """Cancel any orders that haven't filled within the timeout period"""
+        if not self.pending_orders:
+            return
+
+        current_time = time.time()
+        orders_to_remove = []
+
+        for order_id, order_info in self.pending_orders.items():
+            age = current_time - order_info['time']
+            if age > self.order_timeout_seconds:
+                try:
+                    trade = order_info['trade']
+                    # Check if order is still active
+                    if trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit']:
+                        self.ib.cancelOrder(trade.order)
+                        logger.warning(f"[TIMEOUT] Cancelled unfilled order after {age:.0f}s: {trade.order.action} {trade.order.totalQuantity} {order_info['symbol']} @ ${trade.order.lmtPrice:.2f}")
+                        activity_logger.log_order_cancelled(
+                            order_info['symbol'],
+                            trade.order.action,
+                            int(trade.order.totalQuantity),
+                            f"Timeout after {self.order_timeout_seconds}s",
+                            order_id
+                        )
+                        # Restore reserved cash for cancelled BUY orders
+                        if trade.order.action == 'BUY':
+                            qty = float(trade.order.totalQuantity)
+                            price = float(trade.order.lmtPrice)
+                            restored = price * qty + max(qty * 1.50, 2.00)
+                            self.available_cash_usd += restored
+                            logger.debug(f"Restored ${restored:.2f} from cancelled {order_info['symbol']} order")
+                    orders_to_remove.append(order_id)
+                except Exception as e:
+                    logger.error(f"Failed to cancel timed out order {order_id}: {e}")
+                    orders_to_remove.append(order_id)
+
+        # Also check for filled/cancelled orders to clean up
+        for order_id, order_info in self.pending_orders.items():
+            if order_id not in orders_to_remove:
+                trade = order_info['trade']
+                if trade.orderStatus.status in ['Filled', 'Cancelled', 'Inactive']:
+                    # Restore cash for BUY orders that were cancelled/rejected (not filled)
+                    if trade.order.action == 'BUY' and trade.orderStatus.status in ['Cancelled', 'Inactive']:
+                        qty = float(trade.order.totalQuantity)
+                        price = float(trade.order.lmtPrice)
+                        restored = price * qty + max(qty * 1.50, 2.00)
+                        self.available_cash_usd += restored
+                        logger.debug(f"Restored ${restored:.2f} from {trade.orderStatus.status} {order_info['symbol']} order")
+                    orders_to_remove.append(order_id)
+
+        # Remove processed orders
+        for order_id in orders_to_remove:
+            del self.pending_orders[order_id]
+
     def connect(self):
         """Connect to Interactive Brokers and subscribe to market data"""
         try:
+            # Initialize ProcessPoolExecutor for multi-core signal processing
+            if self.use_multiprocessing and self.tick_mode:
+                self.process_pool = ProcessPoolExecutor(max_workers=self.parallel_workers)
+                logger.info(f"MULTI-CORE ENABLED: ProcessPoolExecutor with {self.parallel_workers} workers")
+
             self.ib.connect(self.host, self.port, clientId=self.client_id)
             logger.info(f"Connected to IB Gateway at {self.host}:{self.port}")
 
@@ -510,9 +776,20 @@ class MultiStockBot:
                 self.regime_ticker = self.ib.reqMktData(regime_contract, '', False, False)
                 logger.info(f"Subscribed to regime index: {self.regime_index}")
 
+            # Subscribe to tick events for per-tick processing
+            if self.tick_mode:
+                self.ib.pendingTickersEvent += self.on_pending_tickers
+                logger.info("TICK MODE ENABLED: Processing every tick in real-time")
+
             # Allow time for initial data to arrive
             self.ib.sleep(2)
             logger.info("IBKR streaming market data initialized")
+
+            # Cancel any stale orders from previous sessions
+            self.cancel_stale_orders()
+
+            # Initialize tick data collection if enabled
+            self.init_tick_collection()
 
             return True
         except Exception as e:
@@ -521,6 +798,27 @@ class MultiStockBot:
 
     def disconnect(self):
         """Disconnect from IB and cancel market data subscriptions"""
+        # Shutdown process pool if running
+        if self.process_pool:
+            self.process_pool.shutdown(wait=False)
+            logger.info("ProcessPoolExecutor shutdown")
+
+        # Close tick data files if collecting
+        self.close_tick_files()
+
+        # Stop tick data collector if running
+        if hasattr(self, 'collector_process') and self.collector_process:
+            try:
+                self.collector_process.terminate()
+                self.collector_process.wait(timeout=3)
+                logger.info("Tick data collector stopped")
+                # Remove PID file
+                pid_file = os.path.join(os.path.dirname(__file__), 'data', 'collector_pid.txt')
+                if os.path.exists(pid_file):
+                    os.remove(pid_file)
+            except Exception:
+                pass
+
         # Stop dashboard subprocess if running
         if hasattr(self, 'dashboard_process') and self.dashboard_process:
             try:
@@ -624,6 +922,307 @@ class MultiStockBot:
                 return pos.position
         return 0
 
+    def on_pending_tickers(self, tickers):
+        """Process incoming ticks in real-time (called per-tick when TICK_MODE enabled)
+
+        Multi-core optimization: Batches alpha computations and processes them
+        in parallel across multiple CPU cores using ProcessPoolExecutor.
+        """
+        stocks_to_evaluate = []  # Collect stocks that need signal evaluation
+        current_time = time.time()
+
+        # Phase 1: Update all trader states (sequential, fast)
+        for ticker in tickers:
+            symbol = ticker.contract.symbol
+            if symbol not in self.traders:
+                # Could be regime ticker (SPY)
+                if self.regime_detector and symbol == self.regime_index:
+                    price = self._extract_price_from_ticker(ticker)
+                    if price:
+                        self.regime_detector.update_price(price)
+                continue
+
+            trader = self.traders[symbol]
+            price = self._extract_price_from_ticker(ticker)
+            if not price:
+                continue
+
+            # Update trader state
+            trader.last_price = price
+            trader.last_bid = ticker.bid if ticker.bid and not util.isNan(ticker.bid) and ticker.bid > 0 else price
+            trader.last_ask = ticker.ask if ticker.ask and not util.isNan(ticker.ask) and ticker.ask > 0 else price
+            trader.data_source = 'IBKR'
+
+            # Track price update for health monitoring (prevents false stale data warnings)
+            self.last_price_update = current_time
+            self.consecutive_stale_count = 0
+            self.stale_data_warned = False
+
+            # Get volume/bid/ask size for strategy
+            volume = 0
+            bid_size = 100
+            ask_size = 100
+            if ticker.lastSize and not util.isNan(ticker.lastSize):
+                volume = ticker.lastSize
+            if ticker.bidSize and not util.isNan(ticker.bidSize):
+                bid_size = ticker.bidSize
+            if ticker.askSize and not util.isNan(ticker.askSize):
+                ask_size = ticker.askSize
+
+            # Add price to strategy
+            if trader.strategy_type == "SCALP_ML":
+                trader.strategy.add_tick(
+                    price=price, volume=volume,
+                    bid=trader.last_bid, ask=trader.last_ask,
+                    bid_size=bid_size, ask_size=ask_size
+                )
+            elif trader.strategy_type == "SCALP_TICK":
+                # Tick scalper processes every tick directly
+                if tick_scalper.enabled:
+                    result = tick_scalper.on_tick(symbol, price, volume)
+
+                    # Execute scalp trades immediately (no batching)
+                    if result['action'] == 'BUY' and trader.position == 0:
+                        trader.position = self.get_position(trader)
+                        if trader.position == 0 and self._should_evaluate_signal(trader, current_time):
+                            logger.info(f"[SCALP] {symbol}: BUY @ ${price:.2f} | {result['reason']}")
+                            if self.place_order(trader, 'BUY', trader.position_size):
+                                tick_scalper.enter_position(symbol, price, trader.position_size)
+                                self.symbol_last_trade[symbol] = current_time
+
+                    elif result['action'] == 'SELL' and tick_scalper.get_position(symbol):
+                        trader.position = self.get_position(trader)
+                        if trader.position > 0:
+                            sell_qty = min(int(trader.position), trader.position_size)
+                            logger.info(f"[SCALP] {symbol}: SELL @ ${price:.2f} | {result['reason']} | P&L: {result.get('pnl_pct', 0)*100:+.2f}%")
+                            if self.place_order(trader, 'SELL', sell_qty):
+                                self.symbol_last_trade[symbol] = current_time
+
+                    trader.realtime_ticks += 1
+                    continue  # Skip normal signal evaluation for scalp
+            else:
+                trader.strategy.add_price(price)
+
+            trader.realtime_ticks += 1
+
+            # Check if this stock needs signal evaluation (skip for SCALP_TICK)
+            if trader.strategy_type != "SCALP_TICK" and trader.realtime_ticks >= trader.warmup_required:
+                # Apply filters before adding to batch
+                if self._should_evaluate_signal(trader, current_time):
+                    stocks_to_evaluate.append(trader)
+
+        # Phase 2: Process signals (parallel or sequential)
+        if stocks_to_evaluate:
+            if self.process_pool and self.use_multiprocessing and len(stocks_to_evaluate) > 1:
+                self._evaluate_signals_parallel(stocks_to_evaluate, current_time)
+            else:
+                # Sequential fallback
+                for trader in stocks_to_evaluate:
+                    self._check_signal_for_stock(trader)
+
+    def _should_evaluate_signal(self, trader, current_time: float) -> bool:
+        """Check if a stock should be evaluated for signals (pre-filters)"""
+        symbol = trader.symbol
+
+        # Skip if market is closed
+        if not self.is_market_open():
+            return False
+
+        # Skip if we have a pending order
+        if self._has_pending_order(symbol):
+            return False
+
+        # Signal throttle check
+        last_check = self.symbol_last_signal_check.get(symbol, 0)
+        if current_time - last_check < self.signal_throttle_sec:
+            return False
+
+        # Trade cooldown check
+        last_trade = self.symbol_last_trade.get(symbol, 0)
+        if current_time - last_trade < self.trade_cooldown_sec:
+            return False
+
+        # Not connected check
+        if not self.ib.isConnected():
+            return False
+
+        # Minimum data requirement
+        if trader.strategy_type == "BREAKOUT" or trader.strategy_type == "SCALP_TICK":
+            min_data = trader.strategy.lookback_periods
+        else:
+            min_data = trader.strategy.long_window
+        if len(trader.strategy.prices) < min_data:
+            return False
+
+        return True
+
+    def _evaluate_signals_parallel(self, traders: list, current_time: float):
+        """
+        Evaluate signals for multiple stocks in parallel using ProcessPoolExecutor.
+        Utilizes multiple CPU cores for alpha computation.
+        """
+        # Get regime once (shared across all stocks)
+        regime = 'UNKNOWN'
+        if self.regime_detector:
+            regime = self.regime_detector.get_regime()
+
+        # Prepare batch of signal computation tasks
+        tasks = []
+        trader_map = {}  # symbol -> trader (for result processing)
+
+        for trader in traders:
+            symbol = trader.symbol
+
+            # Mark signal check time
+            self.symbol_last_signal_check[symbol] = current_time
+
+            # Get current position (fast cache lookup)
+            trader.position = self.get_position(trader)
+
+            # Get strategy signal
+            stock_signal = trader.strategy.get_signal()
+
+            # Apply regime-aware logic if enabled
+            if self.adaptive_strategy and regime != 'UNKNOWN':
+                regime_action = self.adaptive_strategy.get_action(symbol, stock_signal, int(trader.position))
+            else:
+                regime_action = stock_signal
+
+            # Skip if not using alpha engine (execute directly)
+            if not alpha_engine.enabled or trader.strategy_type != "BREAKOUT":
+                self._execute_signal(trader, regime_action, 0.0, regime, current_time)
+                continue
+
+            # Prepare alpha context for parallel computation
+            rsi = 50.0
+            if hasattr(trader.strategy, 'get_current_rsi'):
+                rsi = trader.strategy.get_current_rsi()
+            atr_pct = trader.strategy.get_atr_percent()
+            alpha_context = trader._build_alpha_context(rsi, atr_pct, regime)
+
+            # Convert context to dict for pickle serialization
+            context_dict = {
+                'prices': list(alpha_context.prices),  # Convert deque to list for pickle
+                'current_price': alpha_context.current_price,
+                'range_high': alpha_context.range_high,
+                'range_low': alpha_context.range_low,
+                'rsi': alpha_context.rsi,
+                'atr_pct': alpha_context.atr_pct,
+                'relative_volume': alpha_context.relative_volume,
+                'regime': alpha_context.regime,
+                'news_sentiment': alpha_context.news_sentiment,
+                'in_position': alpha_context.in_position
+            }
+
+            tasks.append((symbol, context_dict, regime_action, int(trader.position), regime))
+            trader_map[symbol] = (trader, regime_action, regime)
+
+        # Submit all tasks to process pool and collect results
+        if tasks:
+            try:
+                # Use map for efficient parallel execution
+                results = list(self.process_pool.map(_compute_alpha_worker, tasks, timeout=1.0))
+
+                # Process results and execute trades
+                for symbol, alpha_score, action in results:
+                    if symbol in trader_map:
+                        trader, _, regime = trader_map[symbol]
+                        self._execute_signal(trader, action, alpha_score, regime, current_time)
+
+            except Exception as e:
+                logger.warning(f"Parallel alpha computation error: {e}, falling back to sequential")
+                # Fallback to sequential processing
+                for symbol, (trader, regime_action, regime) in trader_map.items():
+                    self._check_signal_for_stock(trader)
+
+    def _execute_signal(self, trader, action: str, alpha_score: float, regime: str, current_time: float):
+        """Execute a trade signal (BUY/SELL) - runs on main thread"""
+        symbol = trader.symbol
+
+        # Sync strategy state with actual position
+        if trader.position > 0 and not trader.strategy.in_position:
+            trader.strategy.enter_position(trader.last_price)
+        elif trader.position == 0 and trader.strategy.in_position:
+            trader.strategy.exit_position("Closed externally")
+
+        # Execute trade
+        if action == 'BUY' and trader.position == 0:
+            logger.info(f"[TICK] {symbol}: BUY @ ${trader.last_price:.2f} | Alpha: {alpha_score:+.2f} | {regime}")
+            if self.place_order(trader, 'BUY', trader.position_size):
+                trader.strategy.enter_position(trader.last_price)
+                self.symbol_last_trade[symbol] = current_time
+        elif action == 'SELL' and trader.position > 0:
+            sell_qty = min(int(trader.position), trader.position_size)
+            logger.info(f"[TICK] {symbol}: SELL @ ${trader.last_price:.2f} | Alpha: {alpha_score:+.2f} | {regime}")
+            if self.place_order(trader, 'SELL', sell_qty):
+                trader.strategy.exit_position(f"Breakout breakdown ({regime} market)")
+                self.symbol_last_trade[symbol] = current_time
+
+    def _extract_price_from_ticker(self, ticker) -> float:
+        """Extract best price from ticker object"""
+        price = None
+        if ticker.last and not util.isNan(ticker.last) and ticker.last > 0:
+            price = ticker.last
+        elif ticker.bid and ticker.ask and not util.isNan(ticker.bid) and not util.isNan(ticker.ask) and ticker.bid > 0:
+            price = (ticker.bid + ticker.ask) / 2
+        elif ticker.close and not util.isNan(ticker.close) and ticker.close > 0:
+            price = ticker.close
+        return price
+
+    def _has_pending_order(self, symbol: str) -> bool:
+        """Check if there's a pending order for this symbol"""
+        for order_id, order_info in self.pending_orders.items():
+            if order_info['symbol'] == symbol:
+                return True
+        return False
+
+    def _check_signal_for_stock(self, trader):
+        """
+        Evaluate signal for a single stock (sequential fallback).
+        Used when multiprocessing is disabled or for single-stock evaluation.
+        """
+        symbol = trader.symbol
+        current_time = time.time()
+
+        # Mark signal check time
+        self.symbol_last_signal_check[symbol] = current_time
+
+        # Get current position
+        trader.position = self.get_position(trader)
+
+        # Get signal from strategy
+        stock_signal = trader.strategy.get_signal()
+
+        # Get regime
+        regime = 'UNKNOWN'
+        if self.regime_detector:
+            regime = self.regime_detector.get_regime()
+
+        # Apply regime-aware logic if enabled
+        if self.adaptive_strategy and regime != 'UNKNOWN':
+            regime_action = self.adaptive_strategy.get_action(symbol, stock_signal, int(trader.position))
+        else:
+            regime_action = stock_signal
+
+        # Apply alpha engine for BREAKOUT strategy
+        action = regime_action
+        alpha_score = 0.0
+
+        if alpha_engine.enabled and trader.strategy_type == "BREAKOUT":
+            rsi = 50.0
+            if hasattr(trader.strategy, 'get_current_rsi'):
+                rsi = trader.strategy.get_current_rsi()
+            atr_pct = trader.strategy.get_atr_percent()
+
+            alpha_context = trader._build_alpha_context(rsi, atr_pct, regime)
+            alpha_result = alpha_engine.compute_alpha(alpha_context)
+            alpha_score = alpha_result['score']
+
+            action = alpha_engine.get_action_for_signal(alpha_result, regime_action, int(trader.position), trader.symbol)
+
+        # Execute the signal using shared method
+        self._execute_signal(trader, action, alpha_score, regime, current_time)
+
     def update_cash_balance(self):
         """Update available cash and net liquidation (cached, updated every 60s)"""
         current_time = time.time()
@@ -655,8 +1254,13 @@ class MultiStockBot:
             logger.info(f"[TRADING DISABLED] {action} {quantity} {trader.symbol} @ ${price:.2f} - Order skipped")
             return False
 
-        # Market hours check removed - ATR filter handles low-volatility periods
-        # Trading allowed 24/7, ATR >= 0.20% requirement filters out dead markets
+        # Market hours check - only trade during regular market hours
+        if not self.is_market_open():
+            trade_verifier.record_skipped(
+                trader.symbol, action, quantity, price, "Market closed"
+            )
+            # Don't log every skipped order during pre/post market to avoid spam
+            return False
 
         # Reset daily counters at start of new day
         today = datetime.now().date()
@@ -712,10 +1316,9 @@ class MultiStockBot:
             return False
 
         # Check for duplicate/pending orders for this symbol
-        pending_orders = self.ib.openOrders()
-        for pending in pending_orders:
-            if (hasattr(pending.contract, 'symbol') and
-                pending.contract.symbol == trader.symbol and
+        pending_trades = self.ib.openTrades()
+        for pending in pending_trades:
+            if (pending.contract.symbol == trader.symbol and
                 pending.order.action == action):
                 trade_verifier.record_skipped(
                     trader.symbol, action, quantity, price, "Duplicate order pending"
@@ -735,19 +1338,24 @@ class MultiStockBot:
 
         try:
             # Dynamic order pricing based on signal strength and volatility
-            # Calculate signal strength from MA distance
-            if len(trader.strategy.prices) >= trader.strategy.long_window:
+            # Calculate signal strength based on strategy type
+            if trader.strategy_type == "BREAKOUT":
+                # Use breakout strategy's signal strength
+                signal_strength = trader.strategy.get_signal_strength() / 100.0  # Convert 0-100 to 0-1
+            elif hasattr(trader.strategy, 'long_window') and len(trader.strategy.prices) >= trader.strategy.long_window:
+                # MA strategy: calculate from MA distance
                 short_ma = sum(trader.strategy.prices[-trader.strategy.short_window:]) / trader.strategy.short_window
                 long_ma = sum(trader.strategy.prices[-trader.strategy.long_window:]) / trader.strategy.long_window
                 signal_strength = abs(short_ma - long_ma) / long_ma
             else:
                 signal_strength = 0.01  # Default for weak signal
 
-            # Always pay premium to ensure fill
+            # Pay premium to ensure fill - increased for fast movers like AMD
+            # 0.15% premium catches most momentum moves while limiting slippage
             if action == 'BUY':
-                limit_price = round(price * 1.0002, 2)  # Pay 0.02% premium - ensure fill
+                limit_price = round(price * 1.0015, 2)  # Pay 0.15% premium - ensure fill
             else:  # SELL
-                limit_price = round(price * 0.9998, 2)  # Accept 0.02% discount - ensure fill
+                limit_price = round(price * 0.9985, 2)  # Accept 0.15% discount - ensure fill
 
             order = LimitOrder(action, quantity, limit_price)
             ib_trade = self.ib.placeOrder(trader.contract, order)
@@ -755,6 +1363,23 @@ class MultiStockBot:
             # Update trade record with order ID
             trade_verifier.update_order_id(trade_id, ib_trade.order.orderId)
             logger.info(f"Order placed: {action} {quantity} {trader.symbol} @ ${limit_price:.2f} (Trade ID: {trade_id})")
+
+            # Log to activity logger
+            activity_logger.log_order_placed(trader.symbol, action, quantity, limit_price, ib_trade.order.orderId)
+
+            # Track order for timeout cancellation
+            self.pending_orders[ib_trade.order.orderId] = {
+                'symbol': trader.symbol,
+                'time': time.time(),
+                'trade': ib_trade
+            }
+
+            # Reserve cash immediately to prevent over-ordering
+            if action == 'BUY':
+                order_cost = limit_price * quantity
+                commission_buffer = max(quantity * 1.50, 2.00)
+                self.available_cash_usd -= (order_cost + commission_buffer)
+                logger.debug(f"Reserved ${order_cost + commission_buffer:.2f} for {trader.symbol} - Remaining: ${self.available_cash_usd:.2f}")
 
             # Increment daily trade counter
             self.daily_trades += 1
@@ -795,10 +1420,67 @@ class MultiStockBot:
         for symbol, trader in self.traders.items():
             price = self.get_price(trader)
             if price:
-                trader.strategy.add_price(price)
+                # Get tick data from ticker
+                volume = 0
+                bid = trader.last_bid
+                ask = trader.last_ask
+                bid_size = 100
+                ask_size = 100
+
+                if trader.ticker:
+                    if trader.ticker.lastSize and not util.isNan(trader.ticker.lastSize):
+                        volume = trader.ticker.lastSize
+                    if trader.ticker.bidSize and not util.isNan(trader.ticker.bidSize):
+                        bid_size = trader.ticker.bidSize
+                    if trader.ticker.askSize and not util.isNan(trader.ticker.askSize):
+                        ask_size = trader.ticker.askSize
+
+                # Write tick data to CSV if collecting
+                if self.collect_tick_data and symbol in self.tick_writers:
+                    self.tick_writers[symbol].writerow([
+                        datetime.now().isoformat(timespec='milliseconds'),
+                        price,
+                        volume,
+                        bid,
+                        ask,
+                        bid_size,
+                        ask_size,
+                        0, 0, 0, 0,  # Level 2 bid2/ask2 (requires subscription)
+                        0, 0, 0, 0   # Level 2 bid3/ask3 (requires subscription)
+                    ])
+                    self.tick_counts[symbol] = self.tick_counts.get(symbol, 0) + 1
+
+                # SCALP_ML needs additional tick data (bid/ask/volume)
+                if trader.strategy_type == "SCALP_ML":
+                    trader.strategy.add_tick(
+                        price=price,
+                        volume=volume,
+                        bid=bid,
+                        ask=ask,
+                        bid_size=bid_size,
+                        ask_size=ask_size
+                    )
+                else:
+                    trader.strategy.add_price(price)
+                # Track real-time ticks for warmup (separate from preloaded historical data)
+                trader.realtime_ticks += 1
                 collected += 1
+
+        # Flush tick files periodically (every 60 seconds)
+        if self.collect_tick_data and time.time() - self.last_tick_flush > 60:
+            for f in self.tick_files.values():
+                f.flush()
+            self.last_tick_flush = time.time()
+
         if collected > 0:
             logger.info(f"Collected prices for {collected}/{len(self.traders)} stocks (IBKR)")
+            health_monitor.record_price_update(collected)
+
+        # Record tick writes for health monitoring
+        if self.collect_tick_data:
+            total_ticks = sum(self.tick_counts.values())
+            if total_ticks > 0:
+                health_monitor.record_tick_write(total_ticks)
 
         # Update regime detector from IBKR streaming data
         if self.regime_detector and hasattr(self, 'regime_ticker') and self.regime_ticker:
@@ -877,6 +1559,9 @@ class MultiStockBot:
         if self.regime_detector:
             regime = self.regime_detector.get_regime()
 
+        # Phase 1: Compute signals and alpha scores for all stocks
+        trade_candidates = []  # (symbol, trader, action, alpha_score, alpha_signal, stock_signal)
+
         for symbol, trader in self.traders.items():
             if not self.ib.isConnected():
                 logger.warning("Not connected to IB")
@@ -890,6 +1575,12 @@ class MultiStockBot:
 
             if len(trader.strategy.prices) < min_data:
                 logger.info(f"{symbol}: Collecting data ({len(trader.strategy.prices)}/{min_data})")
+                continue
+
+            # CRITICAL: Require real-time warmup before trading
+            # Historical daily bars are NOT sufficient for intraday breakout detection
+            if trader.realtime_ticks < trader.warmup_required:
+                logger.info(f"{symbol}: Warmup ({trader.realtime_ticks}/{trader.warmup_required} ticks)")
                 continue
 
             trader.position = self.get_position(trader)
@@ -919,8 +1610,8 @@ class MultiStockBot:
                 alpha_score = alpha_result['score']
                 alpha_signal = alpha_result['signal']
 
-                # Get final action from alpha engine
-                action = alpha_engine.get_action_for_signal(alpha_result, regime_action, int(trader.position))
+                # Get final action from alpha engine (pass symbol for tick confirmation)
+                action = alpha_engine.get_action_for_signal(alpha_result, regime_action, int(trader.position), symbol)
 
                 logger.info(f"{symbol}: ${trader.last_price:.2f} | Pos: {trader.position} | Signal: {stock_signal} | Alpha: {alpha_score:+.2f} ({alpha_signal}) | Regime: {regime} | Action: {action}")
             else:
@@ -932,41 +1623,150 @@ class MultiStockBot:
             elif trader.position == 0 and trader.strategy.in_position:
                 trader.strategy.exit_position("Closed externally")
 
-            # Execute trades based on alpha-aware action
-            if action == 'BUY' and trader.position == 0:
-                if alpha_engine.enabled:
-                    logger.info(f"{symbol}: BUY SIGNAL [Alpha: {alpha_score:+.2f}, {regime}] - Opening position")
-                else:
-                    logger.info(f"{symbol}: BUY SIGNAL [{regime}] - Opening position")
-                if self.place_order(trader, 'BUY', trader.position_size):
-                    trader.strategy.enter_position(trader.last_price)
+            # Collect trade candidates
+            trade_candidates.append((symbol, trader, action, alpha_score, alpha_signal, stock_signal))
 
-            elif action == 'SELL' and trader.position > 0:
-                sell_qty = min(int(trader.position), trader.position_size)
-                if alpha_engine.enabled:
-                    logger.info(f"{symbol}: SELL SIGNAL [Alpha: {alpha_score:+.2f}, {regime}] - Closing position")
-                else:
-                    logger.info(f"{symbol}: SELL SIGNAL [{regime}] - Closing position")
-                if self.place_order(trader, 'SELL', sell_qty):
-                    exit_reason = "Breakout breakdown" if trader.strategy_type == "BREAKOUT" else "MA crossover"
-                    trader.strategy.exit_position(f"{exit_reason} ({regime} market)")
+        # Phase 2: Sort by alpha score (highest first) and execute trades
+        # Process SELLs first (free up capital), then BUYs by alpha score
+        sells = [(s, t, a, alpha, asig, ssig) for s, t, a, alpha, asig, ssig in trade_candidates if a == 'SELL' and t.position > 0]
+        buys = [(s, t, a, alpha, asig, ssig) for s, t, a, alpha, asig, ssig in trade_candidates if a == 'BUY' and t.position == 0]
 
-            elif regime_action == 'BUY' and action == 'HOLD' and trader.position == 0:
-                logger.info(f"{symbol}: BUY blocked - Alpha {alpha_score:+.2f} < {alpha_engine.threshold}")
+        # Sort BUYs by alpha score descending (highest alpha first)
+        buys.sort(key=lambda x: x[3], reverse=True)
 
-            elif stock_signal == 'SELL' and action == 'HOLD' and trader.position > 0:
-                logger.info(f"{symbol}: SELL signal IGNORED - BULL market, holding position")
+        if buys:
+            logger.info(f"BUY candidates sorted by alpha: {[(s, f'{alpha:+.2f}') for s, t, a, alpha, asig, ssig in buys[:10]]}")
+
+        # Execute SELLs first (free up capital)
+        for symbol, trader, action, alpha_score, alpha_signal, stock_signal in sells:
+            sell_qty = min(int(trader.position), trader.position_size)
+            if alpha_engine.enabled:
+                logger.info(f"{symbol}: SELL SIGNAL [Alpha: {alpha_score:+.2f}, {regime}] - Closing position")
+            else:
+                logger.info(f"{symbol}: SELL SIGNAL [{regime}] - Closing position")
+            if self.place_order(trader, 'SELL', sell_qty):
+                exit_reason = "Breakout breakdown" if trader.strategy_type == "BREAKOUT" else "MA crossover"
+                trader.strategy.exit_position(f"{exit_reason} ({regime} market)")
+
+        # Execute BUYs sorted by alpha (highest first)
+        for symbol, trader, action, alpha_score, alpha_signal, stock_signal in buys:
+            if alpha_engine.enabled:
+                logger.info(f"{symbol}: BUY SIGNAL [Alpha: {alpha_score:+.2f}, {regime}] - Opening position")
+            else:
+                logger.info(f"{symbol}: BUY SIGNAL [{regime}] - Opening position")
+            if self.place_order(trader, 'BUY', trader.position_size):
+                trader.strategy.enter_position(trader.last_price)
+
+    def calculate_betas(self):
+        """Calculate beta for all stocks vs URTH using 1 year of daily returns (stable)"""
+        import yfinance as yf
+
+        # Only calculate once (betas are cached)
+        if hasattr(self, '_betas_calculated') and self._betas_calculated:
+            return
+
+        logger.info("Calculating 1-year betas vs URTH (MSCI World Index)...")
+
+        try:
+            # Fetch 1 year of daily data for URTH
+            urth = yf.Ticker("URTH")
+            urth_hist = urth.history(period="1y")
+
+            if len(urth_hist) < 100:
+                logger.warning("Not enough URTH history for beta calculation")
+                return
+
+            # Calculate URTH daily returns
+            urth_returns = urth_hist['Close'].pct_change().dropna()
+            urth_mean = urth_returns.mean()
+            urth_variance = urth_returns.var()
+
+            if urth_variance == 0:
+                logger.warning("URTH variance is zero, cannot calculate betas")
+                return
+
+            # Calculate beta for each stock
+            symbols = list(self.traders.keys())
+            for symbol in symbols:
+                trader = self.traders[symbol]
+
+                if symbol == 'URTH':
+                    trader.beta = 1.0
+                    continue
+
+                try:
+                    # Fetch stock history
+                    stock = yf.Ticker(symbol)
+                    stock_hist = stock.history(period="1y")
+
+                    if len(stock_hist) < 100:
+                        continue
+
+                    # Align dates with URTH
+                    stock_returns = stock_hist['Close'].pct_change().dropna()
+
+                    # Find common dates
+                    common_dates = urth_returns.index.intersection(stock_returns.index)
+                    if len(common_dates) < 100:
+                        continue
+
+                    urth_ret = urth_returns.loc[common_dates]
+                    stock_ret = stock_returns.loc[common_dates]
+
+                    # Calculate covariance and beta
+                    covariance = ((stock_ret - stock_ret.mean()) * (urth_ret - urth_ret.mean())).mean()
+                    beta = covariance / urth_variance
+
+                    trader.beta = round(beta, 2)
+
+                except Exception as e:
+                    logger.debug(f"Could not calculate beta for {symbol}: {e}")
+                    continue
+
+            self._betas_calculated = True
+
+            # Log some examples
+            betas = [(s, t.beta) for s, t in self.traders.items() if t.beta is not None]
+            betas.sort(key=lambda x: x[1], reverse=True)
+            logger.info(f"Betas calculated for {len(betas)} stocks (1-year daily returns)")
+            if betas:
+                top3 = betas[:3]
+                bot3 = betas[-3:]
+                logger.info(f"  Highest beta: {', '.join(f'{s}={b}' for s,b in top3)}")
+                logger.info(f"  Lowest beta: {', '.join(f'{s}={b}' for s,b in bot3)}")
+
+        except Exception as e:
+            logger.error(f"Beta calculation failed: {e}")
 
     def update_dashboard(self):
         """Update dashboard with all stock states (lightweight for performance)"""
-        states = []
-        for symbol, trader in self.traders.items():
-            states.append(trader.get_state(lightweight=True))  # Skip chart data for WebSocket
-
-        # Include regime state
+        # Get current regime for alpha calculations
+        current_regime = "UNKNOWN"
         regime_state = None
         if self.regime_detector:
             regime_state = self.regime_detector.get_state()
+            current_regime = self.regime_detector.get_regime()
+
+        # Sync positions from IBKR for accurate dashboard display
+        try:
+            positions = self.ib.positions()
+            position_map = {pos.contract.symbol: pos.position for pos in positions}
+            for symbol, trader in self.traders.items():
+                trader.position = position_map.get(symbol, 0)
+        except Exception:
+            pass  # Use cached positions if sync fails
+
+        # Calculate beta vs MSCI World (URTH)
+        self.calculate_betas()
+
+        states = []
+        for symbol, trader in self.traders.items():
+            states.append(trader.get_state(lightweight=True, regime=current_regime))
+
+        # Check if tick collector is running
+        collector_running = False
+        if hasattr(self, 'collector_process') and self.collector_process:
+            collector_running = self.collector_process.poll() is None  # None means still running
 
         state_data = {
             'multi_stock': True,
@@ -985,7 +1785,8 @@ class MultiStockBot:
             'strategy_type': self.strategy_type,
             'data_requirement': self.breakout_lookback if self.strategy_type == "BREAKOUT" else self.long_ma,
             'alpha_engine_enabled': alpha_engine.enabled,
-            'alpha_threshold': alpha_engine.threshold if alpha_engine.enabled else 0.30
+            'alpha_threshold': alpha_engine.threshold if alpha_engine.enabled else 0.30,
+            'collector_running': collector_running
         }
 
         # Update in-memory state (for backward compat)
@@ -1005,11 +1806,42 @@ class MultiStockBot:
     def start(self):
         """Start the trading bot"""
         logger.info("Starting Multi-Stock Trading Bot...")
+
+        # Log timezone and market hours info
+        from datetime import datetime
+        import pytz
+        local_tz = datetime.now().astimezone().tzinfo
+        eastern = pytz.timezone('US/Eastern')
+        now_local = datetime.now()
+        now_eastern = datetime.now(eastern)
+        market_open = now_eastern.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close = now_eastern.replace(hour=16, minute=0, second=0, microsecond=0)
+        is_weekday = now_eastern.weekday() < 5
+        is_market_hours = market_open <= now_eastern <= market_close
+        market_open_now = is_weekday and is_market_hours
+
+        logger.info(f"=" * 50)
+        logger.info(f"LOCAL TIME:  {now_local.strftime('%Y-%m-%d %H:%M:%S %Z')} ({local_tz})")
+        logger.info(f"MARKET TIME: {now_eastern.strftime('%Y-%m-%d %H:%M:%S %Z')} (US/Eastern)")
+        logger.info(f"Market hours: 09:30 - 16:00 ET (Mon-Fri)")
+        if market_open_now:
+            logger.info(f"MARKET STATUS: ** OPEN ** - Live trading active")
+        else:
+            reason = "Weekend" if not is_weekday else "Outside hours"
+            logger.info(f"MARKET STATUS: CLOSED ({reason}) - Orders will queue")
+        logger.info(f"=" * 50)
+
         logger.info(f"Trading: {', '.join(self.symbols)}")
 
-        # Force trading to start disabled for safety - must be enabled from dashboard
-        trading_control.disable(by="bot_startup")
-        logger.info("Trading control: DISABLED (must enable from dashboard)")
+        # Restore trading state from last session (persisted in trading_control.json)
+        saved_state = trading_control.get_state()
+        if saved_state['enabled']:
+            logger.info("Trading control: ENABLED (restored from last session)")
+        else:
+            logger.info("Trading control: DISABLED (enable from dashboard)")
+
+        # Log bot startup
+        activity_logger.log_bot_start()
 
         if not self.dry_run:
             logger.warning("LIVE TRADING MODE - Real money will be used!")
@@ -1020,8 +1852,21 @@ class MultiStockBot:
             logger.error("Failed to connect. Exiting.")
             return
 
+        # Sync existing IBKR positions with scalp strategy for stop-loss tracking
+        if self.strategy_type == 'SCALP_TICK':
+            try:
+                positions = self.ib.positions()
+                pos_list = [(p.contract.symbol, p.position, p.avgCost) for p in positions if p.position > 0]
+                if pos_list:
+                    tick_scalper.sync_positions(pos_list)
+            except Exception as e:
+                logger.warning(f"Could not sync positions: {e}")
+
         # Pre-load historical data so MAs are ready immediately
         self.preload_historical_data()
+
+        # Adjust position sizes to meet minimum value requirement
+        self.adjust_position_sizes_for_min_value()
 
         # Initial cash balance check
         self.update_cash_balance()
@@ -1037,16 +1882,54 @@ class MultiStockBot:
             time.sleep(1)  # Give dashboard time to start
             logger.info(f"Dashboard started at http://localhost:{self.dashboard_port} (PID: {self.dashboard_process.pid})")
 
+        # Start tick data collector for ML training (runs alongside bot)
+        self.collector_process = None
+        try:
+            collector_script = os.path.join(os.path.dirname(__file__), 'collect_tick_data.py')
+            if os.path.exists(collector_script):
+                self.collector_process = subprocess.Popen(
+                    [sys.executable, collector_script],
+                    cwd=os.path.dirname(__file__),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                logger.info(f"Tick data collector started (PID: {self.collector_process.pid})")
+                # Write collector PID to file for dashboard to read
+                pid_file = os.path.join(os.path.dirname(__file__), 'data', 'collector_pid.txt')
+                os.makedirs(os.path.dirname(pid_file), exist_ok=True)
+                with open(pid_file, 'w') as f:
+                    f.write(str(self.collector_process.pid))
+        except Exception as e:
+            logger.warning(f"Failed to start tick data collector: {e}")
+
         logger.info(f"Collecting prices every {self.price_interval}s, checking trades every {self.trade_interval}s")
+
+        # Health monitoring variables
+        self.last_price_update = time.time()
+        self.last_health_check = 0
+        self.stale_data_warned = False
+        self.consecutive_stale_count = 0
 
         try:
             while True:
                 current_time = time.time()
 
-                # Collect prices
-                if current_time - self.last_price_time >= self.price_interval:
-                    self.collect_prices()
-                    self.last_price_time = current_time
+                # Collect prices (skip in tick mode - handled by callback)
+                if not self.tick_mode:
+                    if current_time - self.last_price_time >= self.price_interval:
+                        self.collect_prices()
+                        self.last_price_time = current_time
+                        self.last_price_update = current_time  # Track successful price update
+                        self.consecutive_stale_count = 0
+                        self.stale_data_warned = False
+
+                # Cancel timed-out orders (30 second timeout)
+                self.cancel_timed_out_orders()
+
+                # Health check every 30 seconds
+                if current_time - self.last_health_check >= 30:
+                    self._check_health(current_time)
+                    self.last_health_check = current_time
 
                 # Update events and news (every 5 minutes)
                 if current_time - self.last_info_time >= 300:
@@ -1059,17 +1942,94 @@ class MultiStockBot:
                 # Update dashboard
                 self.update_dashboard()
 
-                # Check signals
-                if current_time - self.last_trade_time >= self.trade_interval:
-                    self.check_signals()
-                    self.last_trade_time = current_time
+                # Check signals (skip in tick mode - handled per-tick)
+                if not self.tick_mode:
+                    if current_time - self.last_trade_time >= self.trade_interval:
+                        self.check_signals()
+                        self.last_trade_time = current_time
 
-                self.ib.sleep(0.1)
+                # Faster loop in tick mode for responsiveness
+                self.ib.sleep(0.01 if self.tick_mode else 0.1)
 
         except KeyboardInterrupt:
             logger.info("Shutting down...")
         finally:
             self.disconnect()
+
+    def _check_health(self, current_time):
+        """Monitor system health: IBKR connection, data freshness, subprocess status"""
+
+        # Update health monitor with current state
+        health_monitor.check_ibkr_connection(self.ib)
+        health_monitor.check_dashboard()
+        health_monitor.check_price_feed()
+        health_monitor.check_tick_collection(self.collect_tick_data)
+
+        # Check IBKR connection
+        if not self.ib.isConnected():
+            health_monitor.record_error('ibkr_connection', 'Disconnected')
+            activity_logger.log_connection('disconnected')
+            logger.error("[HEALTH] IBKR DISCONNECTED - Attempting reconnect...")
+            try:
+                self.ib.disconnect()
+                time.sleep(2)
+                self.connect()
+                logger.info("[HEALTH] IBKR reconnected successfully")
+                activity_logger.log_reconnect(True, "Connection restored")
+            except Exception as e:
+                logger.error(f"[HEALTH] IBKR reconnect failed: {e}")
+                activity_logger.log_reconnect(False, str(e))
+
+        # Check for stale data (no price updates for 60+ seconds)
+        time_since_update = current_time - self.last_price_update
+        if time_since_update > 60:
+            self.consecutive_stale_count += 1
+            if not self.stale_data_warned or self.consecutive_stale_count % 5 == 0:
+                logger.warning(f"[HEALTH] STALE DATA - No price updates for {time_since_update:.0f}s (count: {self.consecutive_stale_count})")
+                self.stale_data_warned = True
+
+            # After 5 consecutive stale checks (2.5 min), try to reconnect
+            if self.consecutive_stale_count >= 5:
+                logger.error("[HEALTH] Persistent stale data - forcing IBKR reconnect")
+                try:
+                    self.ib.disconnect()
+                    time.sleep(2)
+                    self.connect()
+                    self.consecutive_stale_count = 0
+                except Exception as e:
+                    logger.error(f"[HEALTH] Reconnect failed: {e}")
+
+        # Check dashboard subprocess
+        if self.enable_dashboard and hasattr(self, 'dashboard_process') and self.dashboard_process:
+            if self.dashboard_process.poll() is not None:
+                logger.warning("[HEALTH] Dashboard crashed - restarting...")
+                health_monitor.record_error('dashboard', 'Process crashed')
+                activity_logger.log_dashboard_restart("crashed")
+                try:
+                    self.dashboard_process = subprocess.Popen(
+                        [sys.executable, '-m', 'src.multi_dashboard'],
+                        cwd=os.path.dirname(__file__)
+                    )
+                    logger.info(f"[HEALTH] Dashboard restarted (PID: {self.dashboard_process.pid})")
+                except Exception as e:
+                    logger.error(f"[HEALTH] Dashboard restart failed: {e}")
+                    activity_logger.log_error("Dashboard", f"Restart failed: {e}")
+
+        # Check tick collector subprocess
+        if hasattr(self, 'collector_process') and self.collector_process:
+            if self.collector_process.poll() is not None:
+                logger.warning("[HEALTH] Tick collector crashed - restarting...")
+                try:
+                    collector_script = os.path.join(os.path.dirname(__file__), 'collect_tick_data.py')
+                    self.collector_process = subprocess.Popen(
+                        [sys.executable, collector_script],
+                        cwd=os.path.dirname(__file__),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE
+                    )
+                    logger.info(f"[HEALTH] Tick collector restarted (PID: {self.collector_process.pid})")
+                except Exception as e:
+                    logger.error(f"[HEALTH] Tick collector restart failed: {e}")
 
 
 if __name__ == '__main__':

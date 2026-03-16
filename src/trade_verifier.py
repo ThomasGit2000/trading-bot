@@ -74,6 +74,8 @@ class TradeVerifier:
         verifier.verify_trade(trade_id)
     """
 
+    MAX_TRADES = 500  # Limit stored trades to prevent memory growth
+
     def __init__(self, ib=None):
         self.ib = ib
         self.trades: Dict[str, TradeRecord] = {}
@@ -101,6 +103,13 @@ class TradeVerifier:
 
         self.trades[trade_id] = record
         logger.info(f"Trade recorded: {trade_id} - {action} {quantity} {symbol} @ ${price:.2f} [{status.value}]")
+
+        # Trim old trades to prevent memory growth
+        if len(self.trades) > self.MAX_TRADES:
+            sorted_ids = sorted(self.trades.keys())
+            for old_id in sorted_ids[:len(self.trades) - self.MAX_TRADES]:
+                del self.trades[old_id]
+
         return trade_id
 
     def record_skipped(self, symbol: str, action: str, quantity: int,

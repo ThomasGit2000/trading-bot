@@ -2,16 +2,17 @@
 
 ## Overview
 Automated multi-stock trading bot for Interactive Brokers.
-Uses **BREAKOUT strategy** optimized for 1-second tick data.
-Now supports **70 momentum stocks** with intelligent news sentiment analysis.
+Now supports **70 momentum stocks** with multiple trading strategies.
 
-## Current State (Last updated: 2026-03-07)
-- **Strategy**: BREAKOUT with Alpha Engine (confluence filtering)
-- **Active Model**: ALPHA_ENGINE (see models.json)
+## Current State (Last updated: 2026-03-16)
+- **Active Model**: SCALP_TICK (mean-reversion scalping)
+- **Strategy**: Buy dips (0.20% drop), target 0.18%, stop 0.12%
 - **Stock Universe**: 70 hand-picked momentum stocks
+- **Processing**: Per-tick with multi-core parallel computation (12 workers)
 - **News Analysis**: VADER sentiment (industry-standard NLP)
-- **Risk Controls**: 5% stop-loss, 3% trailing stop, circuit breakers
-- **Trading Hours**: Regular market only (after-hours disabled)
+- **Risk Controls**: 5% stop-loss, 3% trailing stop, 60s trade cooldown
+- **Trading Hours**: Regular market only (9:30 AM - 4:00 PM ET)
+- **Model Switching**: http://localhost:8080/models
 - Live trading mode configured (port 7496 for TWS)
 
 ## Stock Universe (70 Stocks)
@@ -50,6 +51,32 @@ Currently trading 70 momentum stocks across multiple sectors:
 - **Max Daily Loss**: $1,000 (14% of account)
 - **Max Daily Trades**: 100 trades
 
+## Tick Mode & Multi-Core Processing
+
+The bot processes every tick from IBKR (~54 ticks/sec/stock) and evaluates signals in parallel across multiple CPU cores.
+
+### Architecture:
+```
+Tick Callback (Main Thread)
+├── Phase 1: Update prices (sequential)
+└── Phase 2: Evaluate signals (parallel via ProcessPoolExecutor)
+    └── 12 worker processes compute alpha scores simultaneously
+```
+
+### Configuration (.env):
+```bash
+TICK_MODE=true              # Per-tick processing (vs per-second polling)
+USE_MULTIPROCESSING=true    # Enable multi-core alpha computation
+PARALLEL_WORKERS=12         # Number of CPU cores to use
+SIGNAL_THROTTLE_SEC=0.1     # Min time between signal checks per stock
+TRADE_COOLDOWN_SEC=60       # Min time between trades per stock
+```
+
+### Benefits:
+- **Faster entry**: Signals evaluated on every tick, not every 30 seconds
+- **CPU efficiency**: Alpha computation distributed across 12 cores
+- **Throttling**: Prevents over-trading while maintaining responsiveness
+
 ## Models System
 
 Trading strategies are stored in `models.json` and viewable at http://localhost:8080/models
@@ -73,12 +100,19 @@ Trading strategies are stored in `models.json` and viewable at http://localhost:
 ### Current Models
 | Model | Description | Status |
 |-------|-------------|--------|
-| **ALPHA_ENGINE** | 6-signal confluence filter (breakout, volume, ATR, RSI, regime, sentiment) | Active |
+| **SCALP_TICK** | Fast mean-reversion scalping (buy dips, target 0.18%, stop 0.12%) | **Active** |
+| **ALPHA_ENGINE** | 6-signal confluence filter (breakout, volume, ATR, RSI, regime, sentiment) | Saved |
+| **SCALP_ML_V1** | LightGBM ML scalping (12 features, 30s prediction) | Saved |
 | **BREAKOUT** | Raw price breakout detection | Saved |
 | **RSI_SWING** | Buy oversold, sell overbought | Saved |
 | **BOLLINGER** | Mean reversion at bands | Saved |
 | **MACD** | Classic trend following | Saved |
 | **DONCHIAN** | Turtle trading method | Saved |
+
+### Switching Models
+1. Go to http://localhost:8080/models
+2. Click "Activate Model" on desired strategy
+3. Restart the bot: `Ctrl+C` then `python multi_bot.py`
 
 ### Adding New Models
 1. Add model entry to `models.json` with parameters and backtest results
@@ -87,8 +121,29 @@ Trading strategies are stored in `models.json` and viewable at http://localhost:
 4. Add config to `.env` if needed
 5. Update dashboard column in `src/multi_dashboard.py` if displaying new data
 
-### Alpha Engine (Current Active Model)
-Combines 6 weighted signals for confluence-based filtering:
+### SCALP_TICK (Current Active Model)
+Fast tick-based scalping using mean reversion. Buys dips, sells bounces.
+
+**Entry Logic (MEAN_REVERSION):**
+- Buys when price DROPS 0.20% in 20 ticks (catching dips)
+- Targets quick 0.18% profit
+- Stops at 0.12% loss
+- Max hold: 50 ticks (~5 seconds)
+- Cooldown: 30 ticks between trades
+
+**Parameters:**
+```bash
+SCALP_STRATEGY=MEAN_REVERSION
+SCALP_LOOKBACK_TICKS=20
+SCALP_ENTRY_PCT=0.20
+SCALP_TARGET_PCT=0.18
+SCALP_STOP_PCT=0.12
+SCALP_MAX_HOLD_TICKS=50
+SCALP_COOLDOWN_TICKS=30
+```
+
+### Alpha Engine
+Generates BUY signals based on 6 weighted alpha signals:
 - **Breakout** (0.35): Distance from range midpoint
 - **Volume** (0.20): Relative volume confirmation
 - **ATR** (0.12): Volatility momentum
@@ -96,9 +151,37 @@ Combines 6 weighted signals for confluence-based filtering:
 - **Regime** (0.11): BULL/BEAR market detection
 - **Sentiment** (0.10): VADER news score
 
-**Scoring**: alpha_score >= 0.30 required for BUY
+**Scoring**: alpha_score >= 0.45 triggers BUY signal
+**Prioritization**: BUY orders executed highest alpha first (capital efficiency)
 **Hard Filters**: RSI < 70 (blocks overbought entries)
 **Backtest**: 65% win rate, +1.40% return (vs 54.5% baseline)
+
+### Scalp ML Strategy (SCALP_ML_V1)
+LightGBM-based ML scalping strategy predicting 30-second forward returns.
+
+**12 Features:**
+- `return_5s`, `return_10s`, `return_30s` - Price momentum
+- `orderbook_imbalance`, `weighted_imbalance` - Order flow
+- `microprice_diff`, `queue_ratio`, `spread` - Microstructure
+- `volume_ratio`, `trade_rate` - Volume signals
+- `vwap_distance`, `volatility_10s` - Price context
+
+**Trading Logic:**
+- Entry: predicted_return > 0.04%
+- Take Profit: 0.07%
+- Stop Loss: 0.04%
+- Max Hold: 60 seconds
+
+**Files:**
+- `src/scalp_ml_strategy.py` - Strategy class
+- `src/scalp_feature_extractor.py` - Feature computation
+- `train_scalp_model.py` - Model training
+- `collect_tick_data.py` - Data collection
+
+**Setup:**
+1. Collect tick data: `python collect_tick_data.py` (5-10 trading days)
+2. Train model: `python train_scalp_model.py`
+3. Enable: Set `STRATEGY_TYPE=SCALP_ML` in .env
 
 ## News Sentiment Analysis
 
@@ -140,7 +223,7 @@ VOLUME_FILTER=false
 
 # Alpha Engine (Confluence Filter)
 ALPHA_ENGINE_ENABLED=true
-ALPHA_THRESHOLD=0.30         # Minimum score for BUY
+ALPHA_THRESHOLD=0.45         # Minimum score for BUY
 ALPHA_RSI_MAX=70             # Block if RSI >= 70
 ALPHA_WEIGHT_BREAKOUT=0.35
 ALPHA_WEIGHT_VOLUME=0.20
@@ -152,8 +235,16 @@ ALPHA_WEIGHT_SENTIMENT=0.10
 
 ### Position Sizes
 ```bash
-# Automatically sized for 10% max position (DKK account)
-POSITION_SIZES={"AAPL": 2, "MSFT": 1, "GOOGL": 2, ...}
+# Auto-generated from stock_universe.py based on category
+# Override specific symbols in SYMBOL_POSITION_OVERRIDES dict
+```
+
+**To override a symbol's position size:**
+Edit `stock_universe.py` and add to `SYMBOL_POSITION_OVERRIDES`:
+```python
+SYMBOL_POSITION_OVERRIDES = {
+    "PLTR": 10,  # Lower size for high-volatility
+}
 ```
 
 ## To Run
@@ -201,6 +292,8 @@ cd C:\ClaudeSpace\trading-bot && python multi_bot.py
 trading-bot/
 ├── multi_bot.py                   # Multi-stock trading bot
 ├── models.json                    # Trading models/strategies config
+├── collect_tick_data.py           # Tick data collection for ML training
+├── train_scalp_model.py           # LightGBM model training
 ├── simple_backtest.py             # Strategy backtesting script
 ├── backtest_alpha_realistic.py    # Alpha engine backtest with portfolio sim
 ├── .env                           # Configuration file
@@ -209,12 +302,17 @@ trading-bot/
 ├── OPTIMIZATION_CHANGELOG.md      # Full changelog of optimizations
 ├── src/
 │   ├── alpha_engine.py            # Alpha confluence filter (6 signals)
+│   ├── scalp_ml_strategy.py       # LightGBM ML scalping strategy
+│   ├── scalp_feature_extractor.py # 12-feature extraction for ML
 │   ├── strategy.py                # Breakout/MA strategy logic
 │   ├── multi_dashboard.py         # FastAPI dashboard server
 │   ├── yfinance_client.py         # Yahoo Finance + VADER sentiment
 │   ├── regime_detector.py         # Market regime detection (SPY)
 │   ├── trading_control.py         # Master trading on/off switch
 │   └── ...
+├── models/                        # Trained ML models
+│   └── scalp_lgbm_v1.txt          # LightGBM model (after training)
+├── data/ticks/                    # Tick data CSVs (for training)
 └── logs/                          # Trading logs
 ```
 
@@ -330,7 +428,7 @@ git push origin master
 
 **GitHub**: https://github.com/ThomasGit2000/trading-bot
 
-**Last Updated**: 2026-03-07 (Alpha Engine added)
+**Last Updated**: 2026-03-12 (Multi-core tick processing, 12 parallel workers)
 
 ---
 

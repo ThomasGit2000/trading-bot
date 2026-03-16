@@ -13,6 +13,7 @@ from src.dashboard_state import bot_state
 from src.yfinance_client import YFinanceClient
 from src.trading_control import trading_control
 from src.alpha_vantage import AlphaVantageClient
+from src.activity_logger import activity_logger
 
 yf_client = YFinanceClient()
 
@@ -256,7 +257,7 @@ DASHBOARD_HTML = """
                 <span style="font-size: 14px; color: #8b949e;">Breakout Strategy | 60-tick Range | 0.2% Threshold | ATR >= 0.05% | 24/7</span>
             </div>
             <a href="/models" class="nav-btn" style="padding:8px 16px;font-size:12px;background:linear-gradient(135deg,#58a6ff,#a371f7);border:none;color:#fff;font-weight:700;">Models</a>
-            <a href="/alpha-cake" class="nav-btn" style="padding:8px 16px;font-size:12px;background:linear-gradient(135deg,#ffd700,#ff6b6b);border:none;color:#000;font-weight:700;">Alpha Cake</a>
+            <a href="/alpha-cake" class="nav-btn" style="padding:8px 16px;font-size:12px;background:linear-gradient(135deg,#ffd700,#ff6b6b);border:none;color:#000;font-weight:700;">AlphaBeta</a>
         </div>
         <div style="display: flex; gap: 8px; align-items: flex-end;">
             <div style="display:flex;gap:4px;align-items:center;height:100%;">
@@ -273,7 +274,10 @@ DASHBOARD_HTML = """
                 </span>
             </div>
             <div style="display:flex;flex-direction:column;gap:4px;align-items:stretch;">
-                <a href="/market-hours" class="nav-btn" style="text-align:center;padding:3px 8px;font-size:12px;">MKT Hours</a>
+                <div style="display:flex;gap:8px;align-items:center;">
+                    <a href="/market-hours" class="nav-btn" style="text-align:center;padding:3px 8px;font-size:12px;">MKT Hours</a>
+                    <span id="et-time" style="color:#8b949e;font-size:11px;font-family:monospace;">--:-- ET</span>
+                </div>
                 <div style="display:flex;gap:4px;">
                     <span id="market-pre" class="status-badge" style="background:#da3633;font-size:12px;padding:3px 8px;cursor:help;" title="Pre-market: Closed">PRE</span>
                     <span id="market-regular" class="status-badge" style="background:#da3633;font-size:12px;padding:3px 8px;cursor:help;" title="Regular market: Closed">MKT</span>
@@ -281,7 +285,14 @@ DASHBOARD_HTML = """
                 </div>
             </div>
             <div style="display:flex;flex-direction:column;gap:4px;align-items:stretch;">
-                <a href="/sectors" class="nav-btn" style="text-align:center;padding:3px 8px;font-size:12px;width:100%;">Sectors</a>
+                <div style="display:flex;gap:4px;">
+                    <a href="/sectors" class="nav-btn" style="text-align:center;padding:3px 8px;font-size:12px;flex:1;">Sectors</a>
+                </div>
+                <a href="/models" id="active-model" class="status-badge" style="background:linear-gradient(135deg,#238636,#2ea043);font-size:11px;text-decoration:none;color:#fff;cursor:pointer;text-align:center;" title="Click to change model">
+                    Model: Loading...
+                </a>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:4px;align-items:stretch;">
                 <span id="trade-stats" class="status-badge" style="background:#30363d;font-size:12px;" title="Verified/Pending/Failed trades">
                     Trades: <span id="trades-filled" style="color:#3fb950;">0</span>/<span id="trades-pending" style="color:#f0883e;">0</span>/<span id="trades-failed" style="color:#f85149;">0</span>
                 </span>
@@ -291,6 +302,7 @@ DASHBOARD_HTML = """
                     TRADING STOPPED
                 </button>
                 <div style="display:flex;gap:4px;">
+                    <span id="collector-status" class="status-badge" style="background:#6e7681;font-size:12px;" title="Tick Data Collector for ML Training">ML: OFF</span>
                     <span id="connection-status" class="status-badge status-disconnected" style="font-size:12px;" title="WebSocket Connection">WS: ...</span>
                     <span id="trading-mode" class="status-badge status-dry" style="font-size:12px;" title="Trading Mode">MODE: DRY</span>
                 </div>
@@ -306,19 +318,19 @@ DASHBOARD_HTML = """
                 <th class="sortable" data-sort="category" onclick="sortTable('category')">Category <span class="sort-arrow"></span></th>
                 <th class="sortable" data-sort="days_to_event" onclick="sortTable('days_to_event')">Event <span class="sort-arrow"></span></th>
                 <th class="sortable" data-sort="price" onclick="sortTable('price')">Price <span class="sort-arrow"></span></th>
-                <th>Trend</th>
                 <th class="sortable" data-sort="position" onclick="sortTable('position')">Pos <span class="sort-arrow"></span></th>
                 <th class="sortable" data-sort="position_size" onclick="sortTable('position_size')">Target <span class="sort-arrow"></span></th>
-                <th style="width:80px;">Ticks</th>
                 <th class="sortable" data-sort="prices_collected" onclick="sortTable('prices_collected')">Data <span class="sort-arrow"></span></th>
-                <th>ATR</th>
                 <th>StopOut</th>
                 <th class="sortable" data-sort="signal" onclick="sortTable('signal')">Signal <span class="sort-arrow"></span></th>
                 <th class="sortable" data-sort="alpha_score" onclick="sortTable('alpha_score')">Alpha <span class="sort-arrow"></span></th>
-                <th id="col-short" class="sortable" data-sort="short_ma" onclick="sortTable('short_ma')">Range Hi <span class="sort-arrow"></span></th>
-                <th id="col-long" class="sortable" data-sort="long_ma" onclick="sortTable('long_ma')">Range Lo <span class="sort-arrow"></span></th>
-                <th class="sortable" data-sort="rsi" onclick="sortTable('rsi')">RSI <span class="sort-arrow"></span></th>
-                <th class="sortable" data-sort="signal_strength" onclick="sortTable('signal_strength')">Sentiment <span class="sort-arrow"></span></th>
+                <th title="Breakout Signal">Breakout</th>
+                <th title="Volume Signal">Volume</th>
+                <th title="ATR Volatility Signal">ATR</th>
+                <th class="sortable" data-sort="rsi" onclick="sortTable('rsi')" title="RSI Signal">RSI <span class="sort-arrow"></span></th>
+                <th title="Market Regime">Regime</th>
+                <th title="News Sentiment Signal">Sentiment</th>
+                <th class="sortable" data-sort="beta" onclick="sortTable('beta')" title="Beta vs MSCI World (URTH)">MSI Beta <span class="sort-arrow"></span></th>
             </tr>
         </thead>
         <tbody id="stocks-body">
@@ -357,6 +369,27 @@ DASHBOARD_HTML = """
             </thead>
             <tbody id="trade-history-body">
                 <tr><td colspan="7" style="text-align:center; color:#8b949e;">No trades yet</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- System Activity Log -->
+    <div class="activity-panel" style="margin:6px;padding:12px;background:#161b22;border:1px solid #30363d;border-radius:8px;max-height:200px;overflow-y:auto;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <span style="font-size:12px; font-weight:600;">System Activity</span>
+            <span id="system-log-count" style="font-size:10px; color:#8b949e;">0 events</span>
+        </div>
+        <table style="width:100%; font-size:11px;">
+            <thead>
+                <tr>
+                    <th style="width:70px;">Time</th>
+                    <th style="width:100px;">Type</th>
+                    <th>Message</th>
+                    <th style="width:60px;">Level</th>
+                </tr>
+            </thead>
+            <tbody id="system-log-body">
+                <tr><td colspan="4" style="text-align:center; color:#8b949e;">No system events</td></tr>
             </tbody>
         </table>
     </div>
@@ -459,6 +492,7 @@ DASHBOARD_HTML = """
         // Traffic light tracking
         let lastHeartbeatPrice = null;
         let lastHeartbeatTime = Date.now();
+        let isFetching = false;  // Prevent concurrent fetches
 
         // Update traffic light every second
         setInterval(() => {
@@ -484,13 +518,20 @@ DASHBOARD_HTML = """
         }, 1000);
 
         async function fetchData() {
+            if (isFetching) {
+                console.log('Skipping fetch - already in progress');
+                return;
+            }
+            isFetching = true;
             try {
                 const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 4000);  // 4s timeout
+                const timeoutId = setTimeout(() => controller.abort(), 10000);  // 10s timeout
+
                 const res = await fetch('/api/stocks', { signal: controller.signal });
                 clearTimeout(timeoutId);
                 const data = await res.json();
 
+                console.log('Fetch complete:', data.stocks?.length, 'stocks');
                 document.getElementById('connection-status').textContent = 'POLL: OK';
                 document.getElementById('connection-status').className = 'status-badge status-live';
 
@@ -498,9 +539,21 @@ DASHBOARD_HTML = """
                 window.dataRequirement = data.data_requirement || 60;
                 window.strategyType = data.strategy_type || 'BREAKOUT';
 
+                // Update active model display
+                try {
+                    const modelRes = await fetch('/api/models/active');
+                    const modelData = await modelRes.json();
+                    const modelEl = document.getElementById('active-model');
+                    if (modelEl && modelData.name) {
+                        modelEl.textContent = modelData.name;
+                        modelEl.title = modelData.description || 'Click to change model';
+                    }
+                } catch (e) { console.log('Model fetch error:', e); }
+
                 // Traffic light - check first stock price
                 if (data.stocks && data.stocks.length > 0) {
                     const price = data.stocks[0].price;
+                    console.log('AAPL price:', price, 'last:', lastHeartbeatPrice);
                     if (price !== lastHeartbeatPrice) {
                         lastHeartbeatPrice = price;
                         lastHeartbeatTime = Date.now();
@@ -508,6 +561,7 @@ DASHBOARD_HTML = """
                 }
 
                 updateDashboard(data);
+                console.log('Dashboard updated');
                 if (modalOpen && modalSymbol) {
                     const stock = data.stocks?.find(s => s.symbol === modalSymbol);
                     if (stock) updateModalRealtime(stock);
@@ -515,23 +569,104 @@ DASHBOARD_HTML = """
             } catch (e) {
                 console.error('Fetch error:', e);
                 const status = document.getElementById('connection-status');
-                status.textContent = e.name === 'AbortError' ? 'POLL: TIMEOUT' : 'POLL: ERR';
+                status.textContent = 'POLL: ERR';
                 status.className = 'status-badge status-disconnected';
+            } finally {
+                isFetching = false;
             }
         }
 
         function connect() {
-            // Poll every 5 seconds (reduced from 2 to prevent browser freeze)
+            console.log('Starting dashboard polling...');
+            // Poll every 3 seconds for price updates
             fetchData();
-            setInterval(fetchData, 5000);
+            setInterval(() => {
+                console.log('Poll interval triggered');
+                fetchData();
+            }, 3000);
+            // Fetch activity logs every 10 seconds
+            fetchActivityLogs();
+            setInterval(fetchActivityLogs, 10000);
+        }
+
+        async function fetchActivityLogs() {
+            try {
+                // Fetch trade activity
+                const tradeResp = await fetch('/api/activity/trades?limit=20');
+                const tradeLogs = await tradeResp.json();
+                updateTradeActivityTable(tradeLogs);
+
+                // Fetch system activity
+                const sysResp = await fetch('/api/activity/system?limit=20');
+                const sysLogs = await sysResp.json();
+                updateSystemActivityTable(sysLogs);
+            } catch (e) {
+                console.error('Error fetching activity logs:', e);
+            }
+        }
+
+        function updateTradeActivityTable(logs) {
+            const tbody = document.getElementById('trade-history-body');
+            if (!tbody || !logs || logs.length === 0) return;
+
+            let html = '';
+            for (const log of logs) {
+                const time = new Date(log.timestamp).toLocaleTimeString('en-US', {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+                const statusClass = log.status === 'filled' ? 'color:#3fb950' :
+                                    log.status === 'cancelled' ? 'color:#f0883e' :
+                                    log.status === 'rejected' ? 'color:#f85149' : 'color:#8b949e';
+                const actionClass = log.action === 'BUY' ? 'color:#3fb950' : 'color:#f85149';
+                html += `<tr>
+                    <td>${time}</td>
+                    <td style="font-size:9px;color:#6e7681;">${log.order_id || '-'}</td>
+                    <td style="font-weight:600;">${log.symbol || '-'}</td>
+                    <td style="${actionClass};font-weight:600;">${log.action || log.type}</td>
+                    <td>${log.quantity || '-'}</td>
+                    <td>$${log.price ? log.price.toFixed(2) : '-'}</td>
+                    <td style="${statusClass};font-weight:500;">${log.status || '-'}</td>
+                </tr>`;
+            }
+            tbody.innerHTML = html;
+        }
+
+        function updateSystemActivityTable(logs) {
+            const tbody = document.getElementById('system-log-body');
+            const countEl = document.getElementById('system-log-count');
+            if (!tbody || !logs) return;
+
+            if (countEl) countEl.textContent = `${logs.length} events`;
+
+            if (logs.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color:#8b949e;">No system events</td></tr>';
+                return;
+            }
+
+            let html = '';
+            for (const log of logs) {
+                const time = new Date(log.timestamp).toLocaleTimeString('en-US', {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+                const levelClass = log.level === 'error' ? 'color:#f85149;font-weight:600' :
+                                   log.level === 'warning' ? 'color:#f0883e' : 'color:#3fb950';
+                const typeColor = log.type === 'ERROR' ? '#f85149' :
+                                  log.type === 'RECONNECT' ? '#f0883e' :
+                                  log.type === 'BOT_START' ? '#3fb950' :
+                                  log.type === 'TRADING_TOGGLE' ? '#58a6ff' : '#8b949e';
+                html += `<tr>
+                    <td>${time}</td>
+                    <td style="color:${typeColor};font-weight:500;">${log.type}</td>
+                    <td style="color:#c9d1d9;">${log.message}</td>
+                    <td style="${levelClass}">${log.level}</td>
+                </tr>`;
+            }
+            tbody.innerHTML = html;
         }
 
         function updateMarketStatus() {
-            // Get current time in ET (US/Eastern)
+            // Get current time in ET (US/Eastern) - parse time string directly for DST safety
             const now = new Date();
-            const etTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
-            const hours = etTime.getHours();
-            const minutes = etTime.getMinutes();
+            const etTimeStr = now.toLocaleTimeString('en-GB', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false });
+            const parts = etTimeStr.split(':');
+            const hours = parseInt(parts[0]);
+            const minutes = parseInt(parts[1]);
             const currentMinutes = hours * 60 + minutes;
 
             // Market hours in ET (minutes from midnight)
@@ -542,9 +677,9 @@ DASHBOARD_HTML = """
             const afterHoursStart = 16 * 60;     // 4:00 PM
             const afterHoursEnd = 20 * 60;       // 8:00 PM
 
-            // Check if it's a weekend
-            const dayOfWeek = etTime.getDay();
-            const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
+            // Check if it's a weekend (get day in ET timezone)
+            const etDateStr = now.toLocaleDateString('en-US', { timeZone: 'America/New_York', weekday: 'short' });
+            const isWeekend = etDateStr === 'Sat' || etDateStr === 'Sun';
 
             const preEl = document.getElementById('market-pre');
             const regEl = document.getElementById('market-regular');
@@ -597,6 +732,12 @@ DASHBOARD_HTML = """
                     aftEl.title = 'All markets closed';
                 }
             }
+
+            // Update ET time display
+            const etTimeEl = document.getElementById('et-time');
+            if (etTimeEl) {
+                etTimeEl.textContent = String(hours).padStart(2, '0') + ':' + String(minutes).padStart(2, '0') + ' ET';
+            }
         }
 
         function updateDashboard(data) {
@@ -618,6 +759,18 @@ DASHBOARD_HTML = """
                 const enabled = data.trading_control.enabled;
                 masterBtn.textContent = enabled ? 'LIVE TRADING' : 'TRADING STOPPED';
                 masterBtn.className = 'master-btn ' + (enabled ? 'trading-live' : 'trading-stopped');
+            }
+
+            // Tick data collector status
+            const collectorStatus = document.getElementById('collector-status');
+            if (data.collector_running) {
+                collectorStatus.textContent = 'ML: REC';
+                collectorStatus.style.background = '#238636';
+                collectorStatus.title = 'Tick Data Collector: Recording data for ML training';
+            } else {
+                collectorStatus.textContent = 'ML: OFF';
+                collectorStatus.style.background = '#6e7681';
+                collectorStatus.title = 'Tick Data Collector: Not running';
             }
 
             // Market status - three sessions (Pre, Regular, After)
@@ -648,15 +801,13 @@ DASHBOARD_HTML = """
                 // Create a simple hash of key data to detect changes
                 const dataHash = data.stocks.map(s => `${s.symbol}:${s.price}:${s.signal}:${s.position}`).join('|');
 
-                // Only rebuild table if data actually changed
-                if (dataHash !== lastDataHash) {
-                    lastDataHash = dataHash;
-                    let stocks = [...data.stocks];
-                    if (currentSort.column) {
-                        stocks = sortStocks(stocks, currentSort.column, currentSort.direction);
-                    }
-                    body.innerHTML = stocks.map((s, i) => createRow(s, i + 1)).join('');
+                // Always rebuild table - remove caching that may cause stale display
+                let stocks = [...data.stocks];
+                if (currentSort.column) {
+                    stocks = sortStocks(stocks, currentSort.column, currentSort.direction);
                 }
+                body.innerHTML = stocks.map((s, i) => createRow(s, i + 1)).join('');
+                lastDataHash = dataHash;
             }
 
             document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
@@ -854,6 +1005,16 @@ DASHBOARD_HTML = """
             const logoLetter = s.symbol.charAt(0);
             const companyName = getCompanyName(s.symbol);
 
+            // Extract alpha components (default to 0 if not available)
+            const ac = s.alpha_components || {};
+            const breakoutVal = ac.breakout || 0;
+            const volumeVal = ac.volume || 0;
+            const atrVal = ac.atr || 0;
+            const rsiVal = ac.rsi || 0;
+            const regimeVal = ac.regime || 0;
+            const sentimentVal = s.news_sentiment || 0;  // Use actual VADER sentiment, not alpha component
+            const betaVal = s.beta;
+
             return `
                 <tr class="${hasPos ? 'has-position' : ''}" onclick="openModal('${s.symbol}')">
                     <td style="text-align:center;color:#8b949e;font-size:11px;">${rowNum}</td>
@@ -874,24 +1035,22 @@ DASHBOARD_HTML = """
                     <td class="category-cell">${catName}</td>
                     <td>${formatEventDays(s.upcoming_events)}</td>
                     <td class="price ${priceClass}">$${s.price?.toFixed(2) || '--'}${changeStr}</td>
-                    <td>${createSparkline(s.price_history || [], s.price)}</td>
                     <td class="${hasPos ? 'position' : 'no-position'}">${s.position || 0}</td>
                     <td>${s.position_size}</td>
-                    <td>${createSparkline(s.tick_prices || [], s.price, 80)}</td>
-                    <td>${s.prices_collected >= (window.dataRequirement || 60) ? '<span style="color:#3fb950;">READY</span>' : s.prices_collected + '/' + (window.dataRequirement || 60)}</td>
-                    <td style="text-align:center;"><span style="color:${s.atr_ok !== false ? '#3fb950' : '#f85149'};">${((s.atr_pct || 0) * 100).toFixed(2)}%</span></td>
+                    <td>${s.warmup_complete ? '<span style="color:#3fb950;">READY</span>' : '<span style="color:#f0883e;">' + (s.realtime_ticks || 0) + '/' + (s.warmup_required || 60) + '</span>'}</td>
                     <td style="text-align:center;">${s.stop_out === 'TRAIL' ? '<span style="color:#f85149;font-weight:600;">Trail</span>' : s.stop_out === 'LOSS' ? '<span style="color:#f85149;font-weight:600;">Loss</span>' : '<span style="color:#8b949e;">--</span>'}</td>
                     <td>
                         <span class="signal-label ${sigClass}">${s.signal || 'WAIT'}</span>
                         <div class="signal-bar"><div class="signal-indicator" style="left:${sigPos}%"></div></div>
                     </td>
                     <td>${formatAlphaScore(s.alpha_score)}</td>
-                    <td class="ma-val ma-short">$${s.short_ma?.toFixed(2) || '--'}</td>
-                    <td class="ma-val ma-long">$${s.long_ma?.toFixed(2) || '--'}</td>
-                    <td class="ma-val" style="color:${(s.rsi || 50) > 70 ? '#f85149' : (s.rsi || 50) < 30 ? '#3fb950' : '#8b949e'};">${s.rsi?.toFixed(1) || '50.0'}</td>
-                    <td>
-                        <div class="news-bar"><div class="news-indicator" style="left:${newsPos}%"></div></div>
-                    </td>
+                    <td style="text-align:center;">${formatComponentScore(breakoutVal)}</td>
+                    <td style="text-align:center;">${formatComponentScore(volumeVal)}</td>
+                    <td style="text-align:center;">${formatComponentScore(atrVal)}</td>
+                    <td style="text-align:center;">${formatComponentScore(rsiVal)}</td>
+                    <td style="text-align:center;">${formatComponentScore(regimeVal)}</td>
+                    <td style="text-align:center;">${formatSentiment(sentimentVal)}</td>
+                    <td style="text-align:center;">${formatBeta(betaVal)}</td>
                 </tr>
             `;
         }
@@ -914,6 +1073,69 @@ DASHBOARD_HTML = """
             // Format as signed percentage with one decimal
             const sign = score >= 0 ? '+' : '';
             return `<span style="color:${color};font-weight:600;">${sign}${(score * 100).toFixed(0)}%</span>`;
+        }
+
+        function formatComponentScore(value) {
+            // Format individual alpha component score (-1 to +1)
+            if (value === undefined || value === null || value === 0) {
+                return '<span style="color:#8b949e;">0</span>';
+            }
+
+            // Color based on value: green (positive), red (negative), gray (neutral)
+            let color;
+            if (value >= 0.3) {
+                color = '#3fb950';  // Strong green
+            } else if (value > 0) {
+                color = '#56d364';  // Light green
+            } else if (value <= -0.3) {
+                color = '#f85149';  // Strong red
+            } else {
+                color = '#f97583';  // Light red
+            }
+
+            const sign = value >= 0 ? '+' : '';
+            return `<span style="color:${color};font-size:11px;">${sign}${value.toFixed(2)}</span>`;
+        }
+
+        function formatSentiment(value) {
+            // Format VADER sentiment score (-100 to +100)
+            if (value === undefined || value === null) {
+                return '<span style="color:#8b949e;">--</span>';
+            }
+
+            let color;
+            if (value >= 20) {
+                color = '#3fb950';  // Green - positive
+            } else if (value <= -20) {
+                color = '#f85149';  // Red - negative
+            } else {
+                color = '#8b949e';  // Gray - neutral
+            }
+
+            const sign = value >= 0 ? '+' : '';
+            return `<span style="color:${color};font-weight:600;font-size:11px;">${sign}${value.toFixed(0)}</span>`;
+        }
+
+        function formatBeta(beta) {
+            // Format beta value vs MSCI World
+            if (beta === undefined || beta === null) {
+                return '<span style="color:#8b949e;">--</span>';
+            }
+
+            let color;
+            if (beta > 1.5) {
+                color = '#f85149';  // Red - very high beta (high risk)
+            } else if (beta > 1.2) {
+                color = '#f0883e';  // Orange - high beta
+            } else if (beta >= 0.8) {
+                color = '#3fb950';  // Green - normal beta
+            } else if (beta >= 0.5) {
+                color = '#58a6ff';  // Blue - low beta (defensive)
+            } else {
+                color = '#8b949e';  // Gray - very low beta
+            }
+
+            return `<span style="color:${color};font-weight:600;font-size:11px;">${beta.toFixed(2)}</span>`;
         }
 
         function formatEventDays(events) {
@@ -1460,15 +1682,19 @@ SECTORS_HTML = """
         }
 
         .summary-stats {
-            display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;
+            display: flex; justify-content: space-between; gap: 16px;
             margin-bottom: 24px;
         }
-        .stat-card {
-            background: #161b22; border-radius: 8px; padding: 16px;
-            border: 1px solid #30363d; text-align: center;
+        .stats-group {
+            display: inline-flex; gap: 8px;
         }
-        .stat-value { font-size: 28px; font-weight: 700; color: #58a6ff; }
-        .stat-label { font-size: 11px; color: #8b949e; margin-top: 4px; }
+        .stat-card {
+            background: #161b22; border-radius: 6px; padding: 6px 10px;
+            border: 1px solid #30363d; text-align: center;
+            display: inline-block;
+        }
+        .stat-value { font-size: 18px; font-weight: 700; color: #58a6ff; }
+        .stat-label { font-size: 10px; color: #8b949e; margin-top: 2px; }
 
         .sector-table {
             background: #161b22; border-radius: 8px; padding: 16px;
@@ -1497,22 +1723,30 @@ SECTORS_HTML = """
         </div>
     </div>
 
-    <div class="summary-stats">
-        <div class="stat-card">
-            <div class="stat-value" id="total-stocks">--</div>
-            <div class="stat-label">Total Stocks</div>
+    <div style="display:flex;justify-content:space-between;margin-bottom:20px;">
+        <div style="display:flex;gap:8px;">
+            <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:6px 12px;text-align:center;">
+                <div style="font-size:16px;font-weight:700;color:#58a6ff;" id="total-stocks">--</div>
+                <div style="font-size:9px;color:#8b949e;">Stocks</div>
+            </div>
+            <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:6px 12px;text-align:center;">
+                <div style="font-size:16px;font-weight:700;color:#58a6ff;" id="total-sectors">--</div>
+                <div style="font-size:9px;color:#8b949e;">Sectors</div>
+            </div>
         </div>
-        <div class="stat-card">
-            <div class="stat-value" id="total-sectors">--</div>
-            <div class="stat-label">Sectors</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-value" id="total-invested">--</div>
-            <div class="stat-label">Total Invested</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-value" id="total-positions">--</div>
-            <div class="stat-label">Open Positions</div>
+        <div style="display:flex;gap:8px;">
+            <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:6px 12px;text-align:center;">
+                <div style="font-size:16px;font-weight:700;color:#3fb950;" id="total-invested">--</div>
+                <div style="font-size:9px;color:#8b949e;">Invested</div>
+            </div>
+            <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:6px 12px;text-align:center;">
+                <div style="font-size:16px;font-weight:700;color:#3fb950;" id="total-positions">--</div>
+                <div style="font-size:9px;color:#8b949e;">Positions</div>
+            </div>
+            <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:6px 12px;text-align:center;">
+                <div style="font-size:16px;font-weight:700;color:#f0883e;" id="portfolio-beta">--</div>
+                <div style="font-size:9px;color:#8b949e;">Beta</div>
+            </div>
         </div>
     </div>
 
@@ -1541,10 +1775,11 @@ SECTORS_HTML = """
                     <th>Distribution</th>
                     <th>Invested Capital</th>
                     <th>Open Positions</th>
+                    <th>Weighted Beta</th>
                 </tr>
             </thead>
             <tbody id="sector-body">
-                <tr><td colspan="5" style="text-align:center;color:#8b949e;">Loading...</td></tr>
+                <tr><td colspan="6" style="text-align:center;color:#8b949e;">Loading...</td></tr>
             </tbody>
         </table>
     </div>
@@ -1574,6 +1809,7 @@ SECTORS_HTML = """
                 const sectorData = {};
                 let totalInvested = 0;
                 let totalPositions = 0;
+                let weightedBetaSum = 0;
 
                 data.stocks.forEach(stock => {
                     const sector = stock.category || 'UNCATEGORIZED';
@@ -1582,7 +1818,8 @@ SECTORS_HTML = """
                             count: 0,
                             invested: 0,
                             positions: 0,
-                            stocks: []
+                            stocks: [],
+                            betaWeightedSum: 0
                         };
                     }
                     sectorData[sector].count++;
@@ -1593,10 +1830,26 @@ SECTORS_HTML = """
                     sectorData[sector].invested += invested;
                     totalInvested += invested;
 
+                    // Calculate weighted beta contribution
+                    const beta = stock.beta || 1.0;
+                    if (invested > 0) {
+                        sectorData[sector].betaWeightedSum += beta * invested;
+                        weightedBetaSum += beta * invested;
+                    }
+
                     if (stock.position > 0) {
                         sectorData[sector].positions++;
                         totalPositions++;
                     }
+                });
+
+                // Calculate portfolio weighted beta
+                const portfolioBeta = totalInvested > 0 ? (weightedBetaSum / totalInvested) : 0;
+
+                // Calculate sector weighted betas
+                Object.keys(sectorData).forEach(sector => {
+                    const s = sectorData[sector];
+                    s.weightedBeta = s.invested > 0 ? (s.betaWeightedSum / s.invested) : null;
                 });
 
                 // Update summary stats
@@ -1604,6 +1857,7 @@ SECTORS_HTML = """
                 document.getElementById('total-sectors').textContent = Object.keys(sectorData).length;
                 document.getElementById('total-invested').textContent = '$' + formatNumber(totalInvested);
                 document.getElementById('total-positions').textContent = totalPositions;
+                document.getElementById('portfolio-beta').textContent = portfolioBeta > 0 ? portfolioBeta.toFixed(2) : '--';
 
                 // Sort sectors by count
                 const sortedSectors = Object.entries(sectorData)
@@ -1725,6 +1979,17 @@ SECTORS_HTML = """
                 const pct = ((data.count / totalStocks) * 100).toFixed(1);
                 const barWidth = (data.count / maxCount) * 100;
 
+                // Format beta with color coding
+                let betaHtml = '<span style="color:#8b949e;">--</span>';
+                if (data.weightedBeta !== null && data.weightedBeta > 0) {
+                    const beta = data.weightedBeta;
+                    let color = '#3fb950';  // Green - normal
+                    if (beta > 1.5) color = '#f85149';      // Red - very high
+                    else if (beta > 1.2) color = '#f0883e'; // Orange - high
+                    else if (beta < 0.8) color = '#58a6ff'; // Blue - defensive
+                    betaHtml = `<span style="color:${color};font-weight:600;">${beta.toFixed(2)}</span>`;
+                }
+
                 return `
                     <tr>
                         <td>
@@ -1737,6 +2002,7 @@ SECTORS_HTML = """
                         </td>
                         <td>${data.invested > 0 ? '$' + formatNumber(data.invested) : '<span style="color:#8b949e;">--</span>'}</td>
                         <td>${data.positions > 0 ? '<span style="color:#3fb950;">' + data.positions + '</span>' : '<span style="color:#8b949e;">0</span>'}</td>
+                        <td>${betaHtml}</td>
                     </tr>
                 `;
             }).join('');
@@ -2016,15 +2282,15 @@ MARKET_HOURS_HTML = """
             </div>
             <div class="info-row">
                 <span class="info-label">Pre-Market</span>
-                <span class="info-value">10:00 - 15:30 CET</span>
+                <span class="info-value" id="us-premarket-hours">--:-- - --:--</span>
             </div>
             <div class="info-row">
                 <span class="info-label">Regular Hours</span>
-                <span class="info-value">15:30 - 22:00 CET</span>
+                <span class="info-value" id="us-regular-hours">--:-- - --:--</span>
             </div>
             <div class="info-row">
                 <span class="info-label">After-Hours</span>
-                <span class="info-value">22:00 - 02:00 CET</span>
+                <span class="info-value" id="us-afterhours-hours">--:-- - --:--</span>
             </div>
             <div class="info-row">
                 <span class="info-label">Local Time (ET)</span>
@@ -2098,18 +2364,17 @@ MARKET_HOURS_HTML = """
     </div>
 
     <script>
-        // Market hours in CET (Copenhagen time) - hours as decimals (e.g., 9.5 = 9:30)
+        // US market hours in ET (fixed, timezone-independent)
+        const US_MARKET_HOURS_ET = {
+            premarket: { start: 4, end: 9.5 },      // 4:00-9:30 AM ET
+            regular: { start: 9.5, end: 16 },       // 9:30 AM - 4:00 PM ET
+            afterhours: { start: 16, end: 20 }      // 4:00-8:00 PM ET
+        };
+
+        // EU market hours in CET (static)
         const markets = {
-            nyse: {
-                premarket: { start: 10, end: 15.5 },      // 4:00-9:30 ET = 10:00-15:30 CET
-                regular: { start: 15.5, end: 22 },         // 9:30-16:00 ET = 15:30-22:00 CET
-                afterhours: { start: 22, end: 26 }         // 16:00-20:00 ET = 22:00-02:00 CET (next day)
-            },
-            nasdaq: {
-                premarket: { start: 10, end: 15.5 },
-                regular: { start: 15.5, end: 22 },
-                afterhours: { start: 22, end: 26 }
-            },
+            nyse: US_MARKET_HOURS_ET,      // Will check status using ET time
+            nasdaq: US_MARKET_HOURS_ET,    // Will check status using ET time
             euronext: {
                 premarket: { start: 7.25, end: 9 },        // 07:15 - 09:00 CET
                 regular: { start: 9, end: 17.5 },          // 09:00 - 17:30 CET
@@ -2132,6 +2397,40 @@ MARKET_HOURS_HTML = """
             }
         };
 
+        // Get current hour in ET timezone (handles DST automatically)
+        function getCurrentETHour() {
+            const now = new Date();
+            const etTime = now.toLocaleTimeString('en-GB', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false });
+            const parts = etTime.split(':');
+            return parseInt(parts[0]) + parseInt(parts[1]) / 60;
+        }
+
+        // Calculate ET to local timezone offset dynamically (handles DST gap)
+        function getETToLocalOffset() {
+            const now = new Date();
+            const localHour = now.getHours() + now.getMinutes() / 60;
+            const etHour = getCurrentETHour();
+            let offset = localHour - etHour;
+            // Handle day boundary
+            if (offset < -12) offset += 24;
+            if (offset > 12) offset -= 24;
+            return offset;
+        }
+
+        // Convert ET hours to local time (CET/CEST) dynamically
+        function etToLocal(etHour) {
+            return etHour + getETToLocalOffset();
+        }
+
+        // US market hours in local time - calculated dynamically for DST
+        function getUSMarketHoursLocal() {
+            return {
+                premarket: { start: etToLocal(4), end: etToLocal(9.5) },
+                regular: { start: etToLocal(9.5), end: etToLocal(16) },
+                afterhours: { start: etToLocal(16), end: etToLocal(20) }
+            };
+        }
+
         function buildTimeline() {
             // Build hour labels
             const header = document.getElementById('timeline-header');
@@ -2145,8 +2444,10 @@ MARKET_HOURS_HTML = """
             }
 
             // Build each market timeline
+            const usMarketLocal = getUSMarketHoursLocal();
             Object.keys(markets).forEach(marketId => {
-                const market = markets[marketId];
+                // Use dynamic local hours for US markets, original for EU markets
+                const market = (marketId === 'nyse' || marketId === 'nasdaq') ? usMarketLocal : markets[marketId];
                 const timeline = document.getElementById(marketId + '-timeline');
                 if (!timeline) return;
 
@@ -2233,8 +2534,12 @@ MARKET_HOURS_HTML = """
                 timeLine.style.left = (currentHour / 24 * 100) + '%';
             });
 
-            // Update market statuses
-            updateMarketStatus('nyse', currentHour, markets.nyse);
+            // Get ET hour for US markets
+            const etHour = getCurrentETHour();
+
+            // Update market statuses (US markets use ET time, EU markets use CET time)
+            updateMarketStatus('nyse', etHour, markets.nyse);
+            updateMarketStatus('nasdaq', etHour, markets.nasdaq);
             updateMarketStatus('euronext', currentHour, markets.euronext);
             updateMarketStatus('london', currentHour, markets.london);
             updateMarketStatus('frankfurt', currentHour, markets.frankfurt);
@@ -2274,8 +2579,28 @@ MARKET_HOURS_HTML = """
             statusEl.innerHTML = '<span class="status-dot ' + dotClass + '"></span>' + status;
         }
 
+        // Format hour as HH:MM
+        function formatHour(hour) {
+            // Handle hours > 24 (next day)
+            const h = Math.floor(hour) % 24;
+            const m = Math.round((hour % 1) * 60);
+            return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
+        }
+
+        // Update US market hours info panel with dynamic times
+        function updateUSMarketHoursInfo() {
+            const usHours = getUSMarketHoursLocal();
+            const preEl = document.getElementById('us-premarket-hours');
+            const regEl = document.getElementById('us-regular-hours');
+            const aftEl = document.getElementById('us-afterhours-hours');
+            if (preEl) preEl.textContent = formatHour(usHours.premarket.start) + ' - ' + formatHour(usHours.premarket.end) + ' CET';
+            if (regEl) regEl.textContent = formatHour(usHours.regular.start) + ' - ' + formatHour(usHours.regular.end) + ' CET';
+            if (aftEl) aftEl.textContent = formatHour(usHours.afterhours.start) + ' - ' + formatHour(usHours.afterhours.end) + ' CET';
+        }
+
         // Initialize
         buildTimeline();
+        updateUSMarketHoursInfo();
         updateCurrentTime();
         setInterval(updateCurrentTime, 1000);
     </script>
@@ -2299,17 +2624,26 @@ def sanitize_floats(obj):
 
 
 def read_state_file():
-    """Read state from JSON file (written by bot process)"""
+    """Read state from JSON file with retries to handle concurrent writes"""
     import os
+    import time
     state_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'bot_state.json')
-    try:
-        with open(state_file, 'r', encoding='utf-8') as f:
-            content = f.read()
-        data = json.loads(content)
-        return sanitize_floats(data)  # Clean NaN/Inf values
-    except (FileNotFoundError, json.JSONDecodeError, IOError) as e:
-        # Fall back to in-memory state if file not available
-        return bot_state.get_state()
+
+    # Try up to 3 times with small delays
+    for attempt in range(3):
+        try:
+            with open(state_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+            if not content.strip():
+                raise json.JSONDecodeError("Empty file", content, 0)
+            data = json.loads(content)
+            return sanitize_floats(data)  # Clean NaN/Inf values
+        except (FileNotFoundError, json.JSONDecodeError, IOError) as e:
+            if attempt < 2:
+                time.sleep(0.05)  # 50ms delay before retry
+                continue
+            # Fall back to in-memory state if file not available
+            return bot_state.get_state()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2326,9 +2660,12 @@ async def get_dashboard():
     threshold = float(config.get('BREAKOUT_THRESHOLD', '0.002')) * 100
     atr_filter = config.get('ATR_FILTER', 'true').lower() == 'true'
     atr_min = float(config.get('ATR_MIN_THRESHOLD', '0.001')) * 100
+    alpha_enabled = config.get('ALPHA_ENGINE_ENABLED', 'false').lower() == 'true'
+    alpha_threshold = float(config.get('ALPHA_THRESHOLD', '0.30'))
 
     atr_text = f"ATR >= {atr_min:.2f}%" if atr_filter else "ATR OFF"
-    subheader = f"{strategy} Strategy | {lookback}-tick Range | {threshold:.1f}% Threshold | {atr_text} | 24/7"
+    alpha_text = f"Alpha Engine (>={alpha_threshold:.0%})" if alpha_enabled else "Alpha OFF"
+    subheader = f"{strategy} + {alpha_text} | {lookback}-tick Range | {threshold:.1f}% Threshold | {atr_text}"
 
     # Replace the static subheader with dynamic values
     html = DASHBOARD_HTML.replace(
@@ -2355,7 +2692,7 @@ async def get_alpha_cake():
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>Alpha Cake - Signal Layers</title>
+    <title>AlphaBeta - Signal Layers</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Righteous&display=swap');
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -2611,8 +2948,22 @@ async def get_alpha_cake():
     <a href="/" class="nav-btn">← Dashboard</a>
 
     <div class="header">
-        <div class="title">ALPHA</div>
-        <div class="subtitle">CAKE</div>
+        <svg width="600" viewBox="0 0 680 200" xmlns="http://www.w3.org/2000/svg" style="margin-bottom: 10px;">
+          <rect x="20" y="10" width="640" height="180" rx="16" fill="none" stroke="rgba(100,100,100,0.3)" stroke-width="0.5"/>
+          <text x="100" y="130" font-family="Georgia, serif" font-size="110" font-weight="700" fill="#185FA5" opacity="0.10" text-anchor="middle">α</text>
+          <text x="200" y="130" font-family="Georgia, serif" font-size="110" font-weight="700" fill="#185FA5" opacity="0.06" text-anchor="middle">β</text>
+          <line x1="50" y1="130" x2="630" y2="130" stroke="rgba(100,100,100,0.3)" stroke-width="0.5"/>
+          <text x="50" y="50" font-family="Georgia, serif" font-size="16" fill="#185FA5" opacity="0.7">α / β</text>
+          <text x="50" y="112" font-family="Georgia, serif" font-size="72" font-weight="700" fill="#c9d1d9" text-anchor="start">Alpha</text>
+          <text x="308" y="112" font-family="Georgia, serif" font-size="62" font-weight="300" fill="#185FA5" opacity="0.6" text-anchor="middle">/</text>
+          <text x="336" y="112" font-family="Georgia, serif" font-size="72" font-weight="700" fill="#185FA5" text-anchor="start">Beta</text>
+          <text x="50" y="162" font-family="sans-serif" font-size="17" font-weight="400" letter-spacing="7" fill="#8b949e" text-anchor="start">OVERVIEW</text>
+          <circle cx="580" cy="68" r="3" fill="#185FA5" opacity="0.5"/>
+          <circle cx="595" cy="68" r="3" fill="#185FA5" opacity="0.3"/>
+          <circle cx="610" cy="68" r="3" fill="#185FA5" opacity="0.15"/>
+          <polyline points="555,110 568,90 578,100 592,74 608,84" fill="none" stroke="#185FA5" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" opacity="0.5"/>
+          <circle cx="592" cy="74" r="3.5" fill="#185FA5" opacity="0.7"/>
+        </svg>
         <div class="tagline">Layered Signal Analysis Framework</div>
     </div>
 
@@ -3066,23 +3417,33 @@ async def get_models():
         <h3>How to Switch Models</h3>
         <p>
             Click "Activate Model" to switch strategies. This will update your .env file with the new parameters.
-            The bot will need to be restarted for changes to take effect. Commission costs are based on $1.00/order ($2.00 round-trip).
+            <strong>The bot must be restarted for changes to take effect.</strong> Commission costs are based on $1.00/order ($2.00 round-trip).
         </p>
+        <div style="margin-top:12px;padding:10px;background:#21262d;border-radius:6px;font-family:monospace;font-size:12px;">
+            <strong>Current Active:</strong> <span id="current-model-name" style="color:#3fb950;">{active}</span>
+        </div>
     </div>
 
     <script>
         function activateModel(modelKey) {{
-            if (confirm('Switch to ' + modelKey + ' strategy? Bot restart required for changes.')) {{
+            if (confirm('Switch to ' + modelKey + ' strategy?\\n\\nThis will update .env. You will need to restart the bot for changes to take effect.')) {{
                 fetch('/api/models/activate/' + modelKey, {{ method: 'POST' }})
                     .then(r => r.json())
                     .then(data => {{
                         if (data.success) {{
-                            alert('Model activated! Restart the bot to apply changes.');
+                            // Show success message with instructions
+                            const msg = 'Model "' + modelKey + '" activated!\\n\\n' +
+                                'The .env file has been updated.\\n\\n' +
+                                'To apply changes:\\n' +
+                                '1. Stop the bot (Ctrl+C in terminal)\\n' +
+                                '2. Restart: python multi_bot.py';
+                            alert(msg);
                             location.reload();
                         }} else {{
                             alert('Error: ' + data.error);
                         }}
-                    }});
+                    }})
+                    .catch(err => alert('Request failed: ' + err));
             }}
         }}
     </script>
@@ -3095,6 +3456,7 @@ async def get_models():
 async def activate_model(model_key: str):
     import json
     import os
+    import re
 
     models_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'models.json')
     env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
@@ -3116,7 +3478,7 @@ async def activate_model(model_key: str):
         with open(models_path, 'w') as f:
             json.dump(models_data, f, indent=2)
 
-        # Update .env with new strategy type
+        # Get model parameters
         model = models_data["models"][model_key]
         params = model.get("parameters", {})
 
@@ -3124,14 +3486,50 @@ async def activate_model(model_key: str):
         with open(env_path, 'r') as f:
             env_content = f.read()
 
+        # Map model keys to STRATEGY_TYPE and settings
+        model_strategy_map = {
+            "BREAKOUT": {"STRATEGY_TYPE": "BREAKOUT", "ALPHA_ENGINE_ENABLED": "false"},
+            "ALPHA_ENGINE": {"STRATEGY_TYPE": "BREAKOUT", "ALPHA_ENGINE_ENABLED": "true"},
+            "SCALP_TICK": {"STRATEGY_TYPE": "SCALP_TICK", "ALPHA_ENGINE_ENABLED": "false"},
+            "SCALP_ML": {"STRATEGY_TYPE": "SCALP_ML", "ALPHA_ENGINE_ENABLED": "false"},
+            "SCALP_ML_V1": {"STRATEGY_TYPE": "SCALP_ML", "ALPHA_ENGINE_ENABLED": "false"},
+            "MA_CROSSOVER": {"STRATEGY_TYPE": "MA_CROSSOVER", "ALPHA_ENGINE_ENABLED": "false"},
+            "RSI_SWING": {"STRATEGY_TYPE": "MA_CROSSOVER", "ALPHA_ENGINE_ENABLED": "false"},
+            "BOLLINGER": {"STRATEGY_TYPE": "MA_CROSSOVER", "ALPHA_ENGINE_ENABLED": "false"},
+            "MACD": {"STRATEGY_TYPE": "MA_CROSSOVER", "ALPHA_ENGINE_ENABLED": "false"},
+            "DONCHIAN": {"STRATEGY_TYPE": "BREAKOUT", "ALPHA_ENGINE_ENABLED": "false"},
+        }
+
+        # Get strategy settings for this model
+        strategy_settings = model_strategy_map.get(model_key, {"STRATEGY_TYPE": model_key, "ALPHA_ENGINE_ENABLED": "false"})
+
         # Update STRATEGY_TYPE
-        import re
-        env_content = re.sub(r'STRATEGY_TYPE=.*', f'STRATEGY_TYPE={model_key}', env_content)
+        env_content = re.sub(r'STRATEGY_TYPE=.*', f'STRATEGY_TYPE={strategy_settings["STRATEGY_TYPE"]}', env_content)
+
+        # Update ALPHA_ENGINE_ENABLED
+        env_content = re.sub(r'ALPHA_ENGINE_ENABLED=.*', f'ALPHA_ENGINE_ENABLED={strategy_settings["ALPHA_ENGINE_ENABLED"]}', env_content)
+
+        # Apply model-specific parameters from models.json
+        for param_key, param_val in params.items():
+            if param_key in ["STRATEGY_TYPE", "features"]:  # Skip meta params
+                continue
+            # Convert boolean/numbers to strings
+            if isinstance(param_val, bool):
+                param_val = "true" if param_val else "false"
+            elif isinstance(param_val, (int, float)):
+                param_val = str(param_val)
+            elif isinstance(param_val, list):
+                continue  # Skip list params like features
+
+            # Update or append parameter
+            pattern = rf'^{param_key}=.*$'
+            if re.search(pattern, env_content, re.MULTILINE):
+                env_content = re.sub(pattern, f'{param_key}={param_val}', env_content, flags=re.MULTILINE)
 
         with open(env_path, 'w') as f:
             f.write(env_content)
 
-        return {"success": True, "model": model_key}
+        return {"success": True, "model": model_key, "strategy_type": strategy_settings["STRATEGY_TYPE"]}
 
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -3140,13 +3538,51 @@ async def activate_model(model_key: str):
 @app.get("/api/stocks")
 async def get_stocks():
     import asyncio
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, read_state_file)
+    return await asyncio.to_thread(read_state_file)
 
 
+@app.get("/api/models/active")
+async def get_active_model():
+    """Get the currently active model info"""
+    import json
+    import os
+    models_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'models.json')
+    try:
+        with open(models_path, 'r') as f:
+            models_data = json.load(f)
+        active_key = models_data.get("active_model", "BREAKOUT")
+        active_model = models_data.get("models", {}).get(active_key, {})
+        return {
+            "key": active_key,
+            "name": active_model.get("name", active_key),
+            "description": active_model.get("description", ""),
+            "parameters": active_model.get("parameters", {})
+        }
+    except Exception as e:
+        return {"key": "UNKNOWN", "name": "Unknown", "error": str(e)}
+
+
+@app.get("/health")
 @app.get("/api/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": bot_state.last_update}
+    """Health check endpoint for monitoring."""
+    import psutil
+    try:
+        process = psutil.Process()
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        cpu_percent = process.cpu_percent()
+    except Exception:
+        memory_mb = 0
+        cpu_percent = 0
+
+    return {
+        "status": "healthy",
+        "timestamp": bot_state.last_update,
+        "stocks_count": len(bot_state.stocks),
+        "memory_mb": round(memory_mb, 1),
+        "cpu_percent": round(cpu_percent, 1),
+        "uptime": bot_state.last_update
+    }
 
 
 @app.get("/api/trading/status")
@@ -3159,7 +3595,26 @@ async def get_trading_status():
 async def toggle_trading():
     """Toggle trading enabled/disabled"""
     new_state = trading_control.toggle(by="dashboard")
+    activity_logger.log_trading_toggle(new_state, "dashboard")
     return {"enabled": new_state, "message": f"Trading {'enabled' if new_state else 'disabled'}"}
+
+
+@app.get("/api/activity/trades")
+async def get_trade_activity(limit: int = 50):
+    """Get recent trade activity logs"""
+    return activity_logger.get_trade_logs(limit)
+
+
+@app.get("/api/activity/system")
+async def get_system_activity(limit: int = 50):
+    """Get recent system activity logs"""
+    return activity_logger.get_system_logs(limit)
+
+
+@app.get("/api/activity/all")
+async def get_all_activity(limit: int = 50):
+    """Get all activity logs"""
+    return activity_logger.get_all_logs(limit)
 
 
 @app.get("/api/stock/{symbol}/history")

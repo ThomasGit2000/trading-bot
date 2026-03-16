@@ -65,6 +65,12 @@ class RegimeDetector:
             self.current_regime = 'BULL'
         elif short_ma < long_ma * (1 - self.threshold):
             self.current_regime = 'BEAR'
+        elif self.current_regime == 'UNKNOWN':
+            # First time with enough data - default based on MA comparison
+            if short_ma >= long_ma:
+                self.current_regime = 'BULL'
+            else:
+                self.current_regime = 'BEAR'
         # else: keep current regime (hysteresis)
 
         if self.current_regime != old_regime:
