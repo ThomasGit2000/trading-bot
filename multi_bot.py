@@ -31,6 +31,8 @@ from src.alpha_engine import alpha_engine, AlphaContext
 from src.health_monitor import health_monitor
 from src.activity_logger import activity_logger
 from src.tick_scalper import tick_scalper
+from src.market_state import market_engine
+from src.selective_rsi_strategy import SelectiveRSIStrategy, SelectiveRSIConfig
 
 # Import stock universe for category support
 try:
@@ -40,14 +42,18 @@ try:
         get_symbols_by_category,
         get_symbol_category,
         get_position_size,
-        generate_position_sizes_json
+        generate_position_sizes_json,
+        SYMBOL_POSITION_OVERRIDES
     )
     UNIVERSE_AVAILABLE = True
 except ImportError:
     UNIVERSE_AVAILABLE = False
+    SYMBOL_POSITION_OVERRIDES = {}
 
-# Minimum position value in USD (to ensure commissions don't eat profits)
-MIN_POSITION_VALUE_USD = float(os.getenv('MIN_POSITION_VALUE_USD', '1000'))
+# Position value limits in USD
+MIN_POSITION_VALUE_USD = float(os.getenv('MIN_POSITION_VALUE_USD', '900'))
+MAX_POSITION_VALUE_USD = float(os.getenv('MAX_POSITION_VALUE_USD', '1500'))
+MAX_SPREAD_PCT = float(os.getenv('MAX_SPREAD_PCT', '0.15'))  # Max bid-ask spread %
 
 # Setup logging
 logging.basicConfig(
@@ -134,6 +140,16 @@ class StockTrader:
                 atr_min_threshold=atr_min_threshold,
                 atr_period=atr_period
             )
+        elif strategy_type == "SELECTIVE_RSI":
+            # Use shared SelectiveRSIStrategy - actual strategy handled by MultiStockBot
+            # Use breakout strategy as placeholder for price collection
+            self.strategy = BreakoutStrategy(
+                lookback_periods=50,
+                breakout_threshold=0.01,
+                stop_loss_pct=stop_loss_pct,
+                trailing_stop_pct=trailing_stop_pct
+            )
+            self.warmup_required = 50  # Need enough data for RSI
         else:  # MA_CROSSOVER (default)
             self.strategy = SimpleStrategy(
                 short_window=short_ma,
@@ -186,6 +202,12 @@ class StockTrader:
                 short_ma = range_high or 0  # Show range high as "short_ma"
                 long_ma = range_low or 0    # Show range low as "long_ma"
             # Get RSI for breakout strategy too
+            if hasattr(self.strategy, 'get_current_rsi'):
+                rsi = self.strategy.get_current_rsi()
+        elif self.strategy_type == "SELECTIVE_RSI":
+            # SELECTIVE_RSI: RSI is calculated by the shared SelectiveRSIStrategy in MultiStockBot
+            # Signal and RSI will be populated by the bot when it adds selective_rsi indicators
+            # For now, get basic RSI from the placeholder strategy if available
             if hasattr(self.strategy, 'get_current_rsi'):
                 rsi = self.strategy.get_current_rsi()
         elif self.strategy_type == "MA_CROSSOVER":
@@ -426,6 +448,27 @@ class MultiStockBot:
         self.stop_loss_pct = float(os.getenv('STOP_LOSS_PCT', '0.05'))
         self.trailing_stop_pct = float(os.getenv('TRAILING_STOP_PCT', '0.03'))
 
+        # Selective RSI Strategy (shared across all symbols)
+        if self.strategy_type == "SELECTIVE_RSI":
+            self.selective_rsi = SelectiveRSIStrategy(SelectiveRSIConfig(
+                rsi_period=int(os.getenv('SELECTIVE_RSI_PERIOD', '14')),
+                rsi_oversold=float(os.getenv('SELECTIVE_RSI_OVERSOLD', '25')),
+                rsi_overbought=float(os.getenv('SELECTIVE_RSI_OVERBOUGHT', '70')),
+                volume_multiplier=float(os.getenv('SELECTIVE_VOLUME_MULT', '1.0')),
+                atr_min_pct=float(os.getenv('SELECTIVE_ATR_MIN', '0.01')),
+                stop_loss_pct=float(os.getenv('SELECTIVE_STOP_LOSS', '0.08')),
+                profit_target_pct=float(os.getenv('SELECTIVE_PROFIT_TARGET', '0.12')),
+                max_positions=int(os.getenv('SELECTIVE_MAX_POSITIONS', '5'))
+            ))
+            self.selective_positions = {}  # symbol -> {'entry': price, 'shares': int}
+            logger.info(f"Selective RSI Strategy: RSI<{self.selective_rsi.config.rsi_oversold}, "
+                       f"Vol>{self.selective_rsi.config.volume_multiplier}x, "
+                       f"Target {self.selective_rsi.config.profit_target_pct*100:.0f}%, "
+                       f"Stop {self.selective_rsi.config.stop_loss_pct*100:.0f}%")
+        else:
+            self.selective_rsi = None
+            self.selective_positions = {}
+
         # Bot settings
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
         self.price_interval = float(os.getenv('PRICE_INTERVAL_SEC', '5'))
@@ -485,6 +528,11 @@ class MultiStockBot:
 
         # YFinance client for events and supplementary data
         self.yfinance_client = YFinanceClient()
+
+        # Set up market state engine with regime detector
+        if self.regime_detector:
+            market_engine.set_regime_detector(self.regime_detector)
+        market_engine.set_yf_client(self.yfinance_client)
 
         # Create traders for each symbol
         self.traders = {}
@@ -593,9 +641,9 @@ class MultiStockBot:
             except Exception as e:
                 logger.error(f"Failed to load regime historical data: {e}")
 
-    def adjust_position_sizes_for_min_value(self):
-        """Adjust position sizes to meet minimum USD value requirement"""
-        logger.info(f"Adjusting position sizes for minimum ${MIN_POSITION_VALUE_USD:.0f} value...")
+    def adjust_position_sizes_for_value_limits(self):
+        """Adjust position sizes to meet min/max USD value requirements"""
+        logger.info(f"Adjusting position sizes for ${MIN_POSITION_VALUE_USD:.0f}-${MAX_POSITION_VALUE_USD:.0f} range...")
         adjusted = 0
 
         for symbol, trader in self.traders.items():
@@ -606,20 +654,42 @@ class MultiStockBot:
             if price <= 0:
                 continue
 
+            # Check if symbol has explicit override - respect it
+            if UNIVERSE_AVAILABLE and symbol in SYMBOL_POSITION_OVERRIDES:
+                override_size = SYMBOL_POSITION_OVERRIDES[symbol]
+                if trader.position_size != override_size:
+                    old_size = trader.position_size
+                    trader.position_size = override_size
+                    adjusted += 1
+                    logger.info(f"{symbol}: Override {old_size} -> {override_size} shares (explicit limit)")
+                continue
+
             current_value = trader.position_size * price
 
-            if current_value < MIN_POSITION_VALUE_USD:
-                # Calculate shares needed for minimum value
+            # Check if exceeds max (1/5 rule)
+            if current_value > MAX_POSITION_VALUE_USD:
+                max_shares = int(MAX_POSITION_VALUE_USD / price)
+                if max_shares < 1:
+                    max_shares = 1  # At least 1 share
+                old_size = trader.position_size
+                trader.position_size = max_shares
+                adjusted += 1
+                logger.info(f"{symbol}: Reduced {old_size} -> {max_shares} shares (${price:.2f} x {max_shares} = ${max_shares * price:.0f}) - MAX limit")
+            # Check if below min
+            elif current_value < MIN_POSITION_VALUE_USD:
                 min_shares = int(MIN_POSITION_VALUE_USD / price) + 1
+                # But cap at max
+                if min_shares * price > MAX_POSITION_VALUE_USD:
+                    min_shares = int(MAX_POSITION_VALUE_USD / price)
                 old_size = trader.position_size
                 trader.position_size = min_shares
                 adjusted += 1
-                logger.info(f"{symbol}: Adjusted {old_size} -> {min_shares} shares (${price:.2f} x {min_shares} = ${min_shares * price:.0f})")
+                logger.info(f"{symbol}: Increased {old_size} -> {min_shares} shares (${price:.2f} x {min_shares} = ${min_shares * price:.0f}) - MIN limit")
 
         if adjusted > 0:
-            logger.info(f"Adjusted {adjusted} position sizes to meet ${MIN_POSITION_VALUE_USD:.0f} minimum")
+            logger.info(f"Adjusted {adjusted} position sizes to meet ${MIN_POSITION_VALUE_USD:.0f}-${MAX_POSITION_VALUE_USD:.0f} range")
         else:
-            logger.info(f"All position sizes already meet ${MIN_POSITION_VALUE_USD:.0f} minimum")
+            logger.info(f"All position sizes already within ${MIN_POSITION_VALUE_USD:.0f}-${MAX_POSITION_VALUE_USD:.0f} range")
 
     def init_tick_collection(self):
         """Initialize tick data CSV files for ML training"""
@@ -976,6 +1046,13 @@ class MultiStockBot:
                     bid=trader.last_bid, ask=trader.last_ask,
                     bid_size=bid_size, ask_size=ask_size
                 )
+            elif trader.strategy_type == "SELECTIVE_RSI":
+                # Add bar to shared selective RSI strategy
+                if self.selective_rsi:
+                    high = ticker.high if ticker.high and not util.isNan(ticker.high) else price
+                    low = ticker.low if ticker.low and not util.isNan(ticker.low) else price
+                    self.selective_rsi.add_bar(symbol, price, high, low, volume)
+                trader.strategy.add_price(price)
             elif trader.strategy_type == "SCALP_TICK":
                 # Tick scalper processes every tick directly
                 if tick_scalper.enabled:
@@ -990,10 +1067,11 @@ class MultiStockBot:
                                 tick_scalper.enter_position(symbol, price, trader.position_size)
                                 self.symbol_last_trade[symbol] = current_time
 
-                    elif result['action'] == 'SELL' and tick_scalper.get_position(symbol):
+                    elif result['action'] == 'SELL':
+                        # Position was already cleared by on_tick(), use result or check IBKR position
                         trader.position = self.get_position(trader)
                         if trader.position > 0:
-                            sell_qty = min(int(trader.position), trader.position_size)
+                            sell_qty = int(trader.position)  # Sell entire position on stop
                             logger.info(f"[SCALP] {symbol}: SELL @ ${price:.2f} | {result['reason']} | P&L: {result.get('pnl_pct', 0)*100:+.2f}%")
                             if self.place_order(trader, 'SELL', sell_qty):
                                 self.symbol_last_trade[symbol] = current_time
@@ -1047,7 +1125,7 @@ class MultiStockBot:
             return False
 
         # Minimum data requirement
-        if trader.strategy_type == "BREAKOUT" or trader.strategy_type == "SCALP_TICK":
+        if trader.strategy_type in ("BREAKOUT", "SCALP_TICK", "SELECTIVE_RSI"):
             min_data = trader.strategy.lookback_periods
         else:
             min_data = trader.strategy.long_window
@@ -1208,6 +1286,11 @@ class MultiStockBot:
         action = regime_action
         alpha_score = 0.0
 
+        if trader.strategy_type == "SELECTIVE_RSI" and self.selective_rsi:
+            # Use Selective RSI strategy logic
+            self._check_selective_rsi_signal(trader, current_time)
+            return  # Handled by selective RSI method
+
         if alpha_engine.enabled and trader.strategy_type == "BREAKOUT":
             rsi = 50.0
             if hasattr(trader.strategy, 'get_current_rsi'):
@@ -1222,6 +1305,45 @@ class MultiStockBot:
 
         # Execute the signal using shared method
         self._execute_signal(trader, action, alpha_score, regime, current_time)
+
+    def _check_selective_rsi_signal(self, trader, current_time: float):
+        """Check Selective RSI signals for a single stock."""
+        symbol = trader.symbol
+
+        # Check for exits first (if we have a position)
+        if symbol in self.selective_positions:
+            pos = self.selective_positions[symbol]
+            should_exit, reason = self.selective_rsi.check_exit_signal(symbol, pos['entry'])
+
+            if should_exit:
+                trader.position = self.get_position(trader)
+                if trader.position > 0:
+                    price = trader.last_price
+                    pnl_pct = (price - pos['entry']) / pos['entry'] * 100
+                    logger.info(f"[SELECTIVE RSI] {symbol}: SELL @ ${price:.2f} | {reason} | P&L: {pnl_pct:+.1f}%")
+                    if self.place_order(trader, 'SELL', int(trader.position)):
+                        del self.selective_positions[symbol]
+                        self.symbol_last_trade[symbol] = current_time
+                return
+
+        # Check for entries (only if not at max positions)
+        if len(self.selective_positions) >= self.selective_rsi.config.max_positions:
+            return
+
+        # Check entry signal
+        should_buy, context = self.selective_rsi.check_entry_signal(symbol)
+
+        if should_buy:
+            trader.position = self.get_position(trader)
+            if trader.position == 0:
+                price = trader.last_price
+                logger.info(f"[SELECTIVE RSI] {symbol}: BUY @ ${price:.2f} | {context['reason']}")
+                if self.place_order(trader, 'BUY', trader.position_size):
+                    self.selective_positions[symbol] = {
+                        'entry': price,
+                        'shares': trader.position_size
+                    }
+                    self.symbol_last_trade[symbol] = current_time
 
     def update_cash_balance(self):
         """Update available cash and net liquidation (cached, updated every 60s)"""
@@ -1261,6 +1383,16 @@ class MultiStockBot:
             )
             # Don't log every skipped order during pre/post market to avoid spam
             return False
+
+        # Spread filter - block BUY orders on wide-spread stocks (SELL always allowed)
+        if action == 'BUY' and trader.last_bid > 0 and trader.last_ask > 0:
+            spread_pct = (trader.last_ask - trader.last_bid) / price * 100
+            if spread_pct > MAX_SPREAD_PCT:
+                trade_verifier.record_skipped(
+                    trader.symbol, action, quantity, price, f"Wide spread {spread_pct:.2f}%"
+                )
+                logger.warning(f"[SPREAD FILTER] {trader.symbol}: Spread {spread_pct:.2f}% > {MAX_SPREAD_PCT:.2f}% - BUY blocked")
+                return False
 
         # Reset daily counters at start of new day
         today = datetime.now().date()
@@ -1568,7 +1700,7 @@ class MultiStockBot:
                 continue
 
             # Check minimum data requirement (depends on strategy type)
-            if trader.strategy_type == "BREAKOUT":
+            if trader.strategy_type in ("BREAKOUT", "SCALP_TICK", "SELECTIVE_RSI"):
                 min_data = trader.strategy.lookback_periods
             else:
                 min_data = trader.strategy.long_window
@@ -1761,7 +1893,29 @@ class MultiStockBot:
 
         states = []
         for symbol, trader in self.traders.items():
-            states.append(trader.get_state(lightweight=True, regime=current_regime))
+            state = trader.get_state(lightweight=True, regime=current_regime)
+
+            # Add SELECTIVE_RSI indicators if strategy is active
+            if self.strategy_type == "SELECTIVE_RSI" and self.selective_rsi:
+                indicators = self.selective_rsi.get_indicators(symbol)
+                state['selective_rsi'] = {
+                    'rsi': round(indicators.get('rsi') or 0, 1),
+                    'rel_vol': round(indicators.get('rel_vol') or 0, 2),
+                    'atr_pct': round((indicators.get('atr_pct') or 0) * 100, 2),  # Convert to %
+                }
+                # Check if in oversold zone (potential buy)
+                rsi = indicators.get('rsi')
+                if rsi is not None and rsi < self.selective_rsi.config.rsi_oversold:
+                    state['selective_rsi']['oversold'] = True
+                # Check if in position
+                if symbol in self.selective_positions:
+                    pos = self.selective_positions[symbol]
+                    state['selective_rsi']['in_position'] = True
+                    state['selective_rsi']['entry_price'] = pos['entry']
+                    pnl_pct = (trader.last_price - pos['entry']) / pos['entry'] * 100 if pos['entry'] > 0 else 0
+                    state['selective_rsi']['pnl_pct'] = round(pnl_pct, 2)
+
+            states.append(state)
 
         # Check if tick collector is running
         collector_running = False
@@ -1866,7 +2020,7 @@ class MultiStockBot:
         self.preload_historical_data()
 
         # Adjust position sizes to meet minimum value requirement
-        self.adjust_position_sizes_for_min_value()
+        self.adjust_position_sizes_for_value_limits()
 
         # Initial cash balance check
         self.update_cash_balance()
