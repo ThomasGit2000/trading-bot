@@ -1166,7 +1166,13 @@ class MultiStockBot:
             else:
                 regime_action = stock_signal
 
-            # Skip if not using alpha engine (execute directly)
+            # SELECTIVE_RSI is handled separately via _check_selective_rsi_signal
+            if trader.strategy_type == "SELECTIVE_RSI":
+                if self.selective_rsi:
+                    self._check_selective_rsi_signal(trader, current_time)
+                continue
+
+            # Skip if not using alpha engine (execute directly for BREAKOUT only)
             if not alpha_engine.enabled or trader.strategy_type != "BREAKOUT":
                 self._execute_signal(trader, regime_action, 0.0, regime, current_time)
                 continue
