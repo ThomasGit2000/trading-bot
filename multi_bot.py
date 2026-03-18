@@ -607,6 +607,13 @@ class MultiStockBot:
                     for bar in prices_to_load:
                         trader.strategy.add_price(bar.close)
 
+                    # Also load into SelectiveRSI strategy (uses add_historical_bar for direct loading)
+                    if self.selective_rsi:
+                        for bar in prices_to_load:
+                            self.selective_rsi.add_historical_bar(
+                                symbol, bar.close, bar.high, bar.low, bar.volume
+                            )
+
                     # Set last price from most recent bar
                     trader.last_price = bars[-1].close
                     trader.previous_close = bars[-2].close if len(bars) > 1 else bars[-1].close
