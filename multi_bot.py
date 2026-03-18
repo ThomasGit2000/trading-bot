@@ -1930,27 +1930,27 @@ class MultiStockBot:
                 state['rsi'] = round(rsi, 1) if rsi else 0
 
                 # Set signal and strength based on RSI
+                # Signal bar position matches RSI: low RSI = left (green/BUY), high RSI = right (red/SELL)
                 if rsi is not None:
                     oversold = self.selective_rsi.config.rsi_oversold  # 25
                     overbought = self.selective_rsi.config.rsi_overbought  # 70
 
                     if rsi < oversold:
-                        # Oversold - potential BUY
+                        # Oversold - BUY signal (left side, green)
                         state['signal'] = 'BUY'
-                        # Strength: -100 (most oversold) to 0 (at threshold)
-                        state['signal_strength'] = -100 + (rsi / oversold * 100)
+                        # Lower RSI = more negative = further left
+                        state['signal_strength'] = (rsi - 50) * 2  # RSI 0 = -100, RSI 25 = -50
                         state['selective_rsi']['oversold'] = True
                     elif rsi > overbought:
-                        # Overbought - potential SELL
+                        # Overbought - SELL signal (right side, red)
                         state['signal'] = 'SELL'
-                        # Strength: 0 (at threshold) to +100 (most overbought)
-                        state['signal_strength'] = (rsi - overbought) / (100 - overbought) * 100
+                        # Higher RSI = more positive = further right
+                        state['signal_strength'] = (rsi - 50) * 2  # RSI 70 = +40, RSI 100 = +100
                     else:
-                        # Neutral zone - HOLD/WAIT
+                        # Neutral zone - HOLD
                         state['signal'] = 'HOLD'
-                        # Strength centered around 0 for neutral
-                        midpoint = (oversold + overbought) / 2  # 47.5
-                        state['signal_strength'] = (rsi - midpoint) / midpoint * 50
+                        # RSI 25-70 maps to strength -50 to +40 (centered)
+                        state['signal_strength'] = (rsi - 50) * 2
 
                 # Check if in position
                 if symbol in self.selective_positions:
