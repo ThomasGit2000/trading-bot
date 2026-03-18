@@ -1699,6 +1699,11 @@ class MultiStockBot:
                 logger.warning("Not connected to IB")
                 continue
 
+            # SELECTIVE_RSI is handled by _check_selective_rsi_signal via tick events
+            # Skip it here to prevent duplicate/conflicting trades
+            if trader.strategy_type == "SELECTIVE_RSI":
+                continue
+
             # Check minimum data requirement (depends on strategy type)
             if trader.strategy_type in ("BREAKOUT", "SCALP_TICK", "SELECTIVE_RSI"):
                 min_data = trader.strategy.lookback_periods
