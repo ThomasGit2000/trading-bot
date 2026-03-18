@@ -1916,15 +1916,42 @@ class MultiStockBot:
             # Add SELECTIVE_RSI indicators if strategy is active
             if self.strategy_type == "SELECTIVE_RSI" and self.selective_rsi:
                 indicators = self.selective_rsi.get_indicators(symbol)
-                state['selective_rsi'] = {
-                    'rsi': round(indicators.get('rsi') or 0, 1),
-                    'rel_vol': round(indicators.get('rel_vol') or 0, 2),
-                    'atr_pct': round((indicators.get('atr_pct') or 0) * 100, 2),  # Convert to %
-                }
-                # Check if in oversold zone (potential buy)
                 rsi = indicators.get('rsi')
-                if rsi is not None and rsi < self.selective_rsi.config.rsi_oversold:
-                    state['selective_rsi']['oversold'] = True
+                rel_vol = indicators.get('rel_vol')
+                atr_pct = indicators.get('atr_pct')
+
+                state['selective_rsi'] = {
+                    'rsi': round(rsi or 0, 1),
+                    'rel_vol': round(rel_vol or 0, 2),
+                    'atr_pct': round((atr_pct or 0) * 100, 2),  # Convert to %
+                }
+
+                # Update main signal based on RSI levels
+                state['rsi'] = round(rsi, 1) if rsi else 0
+
+                # Set signal and strength based on RSI
+                if rsi is not None:
+                    oversold = self.selective_rsi.config.rsi_oversold  # 25
+                    overbought = self.selective_rsi.config.rsi_overbought  # 70
+
+                    if rsi < oversold:
+                        # Oversold - potential BUY
+                        state['signal'] = 'BUY'
+                        # Strength: -100 (most oversold) to 0 (at threshold)
+                        state['signal_strength'] = -100 + (rsi / oversold * 100)
+                        state['selective_rsi']['oversold'] = True
+                    elif rsi > overbought:
+                        # Overbought - potential SELL
+                        state['signal'] = 'SELL'
+                        # Strength: 0 (at threshold) to +100 (most overbought)
+                        state['signal_strength'] = (rsi - overbought) / (100 - overbought) * 100
+                    else:
+                        # Neutral zone - HOLD/WAIT
+                        state['signal'] = 'HOLD'
+                        # Strength centered around 0 for neutral
+                        midpoint = (oversold + overbought) / 2  # 47.5
+                        state['signal_strength'] = (rsi - midpoint) / midpoint * 50
+
                 # Check if in position
                 if symbol in self.selective_positions:
                     pos = self.selective_positions[symbol]
