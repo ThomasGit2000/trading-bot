@@ -14,8 +14,10 @@ from src.yfinance_client import YFinanceClient
 from src.trading_control import trading_control
 from src.alpha_vantage import AlphaVantageClient
 from src.activity_logger import activity_logger
+from src.market_state import market_engine
 
 yf_client = YFinanceClient()
+market_engine.set_yf_client(yf_client)
 
 # Initialize Alpha Vantage client for news
 try:
@@ -256,8 +258,9 @@ DASHBOARD_HTML = """
                 <h1 style="font-size: 20px;">Master Board</h1>
                 <span style="font-size: 14px; color: #8b949e;">Breakout Strategy | 60-tick Range | 0.2% Threshold | ATR >= 0.05% | 24/7</span>
             </div>
-            <a href="/models" class="nav-btn" style="padding:8px 16px;font-size:12px;background:linear-gradient(135deg,#58a6ff,#a371f7);border:none;color:#fff;font-weight:700;">Models</a>
-            <a href="/alpha-cake" class="nav-btn" style="padding:8px 16px;font-size:12px;background:linear-gradient(135deg,#ffd700,#ff6b6b);border:none;color:#000;font-weight:700;">AlphaBeta</a>
+            <a href="/sectors" class="nav-btn" style="padding:8px 16px;font-size:12px;">Sector/Portfolio</a>
+            <a href="/market" class="nav-btn" style="padding:8px 16px;font-size:12px;">Market</a>
+            <a href="/alpha-cake" class="nav-btn" style="padding:8px 16px;font-size:12px;">Beta</a>
         </div>
         <div style="display: flex; gap: 8px; align-items: flex-end;">
             <div style="display:flex;gap:4px;align-items:center;height:100%;">
@@ -286,7 +289,7 @@ DASHBOARD_HTML = """
             </div>
             <div style="display:flex;flex-direction:column;gap:4px;align-items:stretch;">
                 <div style="display:flex;gap:4px;">
-                    <a href="/sectors" class="nav-btn" style="text-align:center;padding:3px 8px;font-size:12px;flex:1;">Sectors</a>
+                    <a href="/models" class="nav-btn" style="text-align:center;padding:3px 8px;font-size:12px;flex:1;">Models</a>
                 </div>
                 <a href="/models" id="active-model" class="status-badge" style="background:linear-gradient(135deg,#238636,#2ea043);font-size:11px;text-decoration:none;color:#fff;cursor:pointer;text-align:center;" title="Click to change model">
                     Model: Loading...
@@ -323,18 +326,16 @@ DASHBOARD_HTML = """
                 <th class="sortable" data-sort="prices_collected" onclick="sortTable('prices_collected')">Data <span class="sort-arrow"></span></th>
                 <th>StopOut</th>
                 <th class="sortable" data-sort="signal" onclick="sortTable('signal')">Signal <span class="sort-arrow"></span></th>
-                <th class="sortable" data-sort="alpha_score" onclick="sortTable('alpha_score')">Alpha <span class="sort-arrow"></span></th>
-                <th title="Breakout Signal">Breakout</th>
-                <th title="Volume Signal">Volume</th>
-                <th title="ATR Volatility Signal">ATR</th>
-                <th class="sortable" data-sort="rsi" onclick="sortTable('rsi')" title="RSI Signal">RSI <span class="sort-arrow"></span></th>
-                <th title="Market Regime">Regime</th>
+                <th class="sortable" data-sort="rsi" onclick="sortTable('rsi')" title="RSI (Buy &lt;25, Sell &gt;70)">RSI <span class="sort-arrow"></span></th>
+                <th class="sortable" data-sort="rel_vol" onclick="sortTable('rel_vol')" title="Relative Volume vs Average (Buy &gt;1.0x)">Rel Vol <span class="sort-arrow"></span></th>
+                <th class="sortable" data-sort="atr_pct" onclick="sortTable('atr_pct')" title="ATR as % of Price (Buy &gt;1%)">ATR% <span class="sort-arrow"></span></th>
+                <th title="Position P&L %">P&L</th>
                 <th title="News Sentiment Signal">Sentiment</th>
                 <th class="sortable" data-sort="beta" onclick="sortTable('beta')" title="Beta vs MSCI World (URTH)">MSI Beta <span class="sort-arrow"></span></th>
             </tr>
         </thead>
         <tbody id="stocks-body">
-            <tr><td colspan="18" style="text-align:center;color:#8b949e;">Loading...</td></tr>
+            <tr><td colspan="15" style="text-align:center;color:#8b949e;">Loading...</td></tr>
         </tbody>
     </table>
 
@@ -856,6 +857,20 @@ DASHBOARD_HTML = """
                     valB = getDaysToEvent(b.upcoming_events);
                 }
 
+                // Handle SELECTIVE_RSI columns (nested under selective_rsi)
+                if (column === 'rel_vol') {
+                    valA = (a.selective_rsi || {}).rel_vol || 0;
+                    valB = (b.selective_rsi || {}).rel_vol || 0;
+                }
+                if (column === 'atr_pct') {
+                    valA = (a.selective_rsi || {}).atr_pct || 0;
+                    valB = (b.selective_rsi || {}).atr_pct || 0;
+                }
+                if (column === 'rsi') {
+                    valA = (a.selective_rsi || {}).rsi || a.rsi || 0;
+                    valB = (b.selective_rsi || {}).rsi || b.rsi || 0;
+                }
+
                 // Handle null/undefined
                 if (valA == null) valA = '';
                 if (valB == null) valB = '';
@@ -1005,14 +1020,15 @@ DASHBOARD_HTML = """
             const logoLetter = s.symbol.charAt(0);
             const companyName = getCompanyName(s.symbol);
 
-            // Extract alpha components (default to 0 if not available)
-            const ac = s.alpha_components || {};
-            const breakoutVal = ac.breakout || 0;
-            const volumeVal = ac.volume || 0;
-            const atrVal = ac.atr || 0;
-            const rsiVal = ac.rsi || 0;
-            const regimeVal = ac.regime || 0;
-            const sentimentVal = s.news_sentiment || 0;  // Use actual VADER sentiment, not alpha component
+            // Extract SELECTIVE_RSI indicators (or alpha components for other strategies)
+            const sr = s.selective_rsi || {};
+            const rsiValue = sr.rsi || s.rsi || 0;
+            const relVolValue = sr.rel_vol || 0;
+            const atrPctValue = sr.atr_pct || 0;
+            const pnlPct = sr.pnl_pct || 0;
+            const inPosition = sr.in_position || false;
+            const isOversold = sr.oversold || false;
+            const sentimentVal = s.news_sentiment || 0;
             const betaVal = s.beta;
 
             return `
@@ -1043,12 +1059,10 @@ DASHBOARD_HTML = """
                         <span class="signal-label ${sigClass}">${s.signal || 'WAIT'}</span>
                         <div class="signal-bar"><div class="signal-indicator" style="left:${sigPos}%"></div></div>
                     </td>
-                    <td>${formatAlphaScore(s.alpha_score)}</td>
-                    <td style="text-align:center;">${formatComponentScore(breakoutVal)}</td>
-                    <td style="text-align:center;">${formatComponentScore(volumeVal)}</td>
-                    <td style="text-align:center;">${formatComponentScore(atrVal)}</td>
-                    <td style="text-align:center;">${formatComponentScore(rsiVal)}</td>
-                    <td style="text-align:center;">${formatComponentScore(regimeVal)}</td>
+                    <td style="text-align:center;">${formatRSI(rsiValue, isOversold)}</td>
+                    <td style="text-align:center;">${formatRelVol(relVolValue)}</td>
+                    <td style="text-align:center;">${formatATRPct(atrPctValue)}</td>
+                    <td style="text-align:center;">${formatPnL(pnlPct, inPosition)}</td>
                     <td style="text-align:center;">${formatSentiment(sentimentVal)}</td>
                     <td style="text-align:center;">${formatBeta(betaVal)}</td>
                 </tr>
@@ -1095,6 +1109,95 @@ DASHBOARD_HTML = """
 
             const sign = value >= 0 ? '+' : '';
             return `<span style="color:${color};font-size:11px;">${sign}${value.toFixed(2)}</span>`;
+        }
+
+        function formatRSI(rsi, isOversold) {
+            // Format RSI value for SELECTIVE_RSI strategy
+            // Buy zone: RSI < 25 (green), Sell zone: RSI > 70 (red), Neutral: gray
+            if (rsi === undefined || rsi === null || rsi === 0) {
+                return '<span style="color:#8b949e;">--</span>';
+            }
+
+            let color, weight;
+            if (rsi < 25) {
+                color = '#3fb950';  // Green - oversold (BUY zone)
+                weight = '700';
+            } else if (rsi < 30) {
+                color = '#56d364';  // Light green - approaching oversold
+                weight = '600';
+            } else if (rsi > 70) {
+                color = '#f85149';  // Red - overbought (SELL zone)
+                weight = '700';
+            } else if (rsi > 65) {
+                color = '#f97583';  // Light red - approaching overbought
+                weight = '600';
+            } else {
+                color = '#8b949e';  // Gray - neutral
+                weight = '400';
+            }
+
+            return `<span style="color:${color};font-weight:${weight};font-size:12px;">${rsi.toFixed(1)}</span>`;
+        }
+
+        function formatRelVol(relVol) {
+            // Format relative volume (vs average)
+            // > 1.0 = volume confirmation (green), < 0.5 = low volume (red)
+            if (relVol === undefined || relVol === null || relVol === 0) {
+                return '<span style="color:#8b949e;">--</span>';
+            }
+
+            let color;
+            if (relVol >= 1.5) {
+                color = '#3fb950';  // Strong green - high volume
+            } else if (relVol >= 1.0) {
+                color = '#56d364';  // Light green - confirmed
+            } else if (relVol >= 0.5) {
+                color = '#8b949e';  // Gray - normal
+            } else {
+                color = '#f97583';  // Light red - low volume
+            }
+
+            return `<span style="color:${color};font-size:11px;">${relVol.toFixed(2)}x</span>`;
+        }
+
+        function formatATRPct(atrPct) {
+            // Format ATR as percentage (volatility filter)
+            // > 1% = sufficient volatility (green), < 1% = low volatility (gray)
+            if (atrPct === undefined || atrPct === null || atrPct === 0) {
+                return '<span style="color:#8b949e;">--</span>';
+            }
+
+            let color;
+            if (atrPct >= 2.0) {
+                color = '#3fb950';  // Strong green - high volatility
+            } else if (atrPct >= 1.0) {
+                color = '#56d364';  // Light green - sufficient
+            } else {
+                color = '#8b949e';  // Gray - low volatility
+            }
+
+            return `<span style="color:${color};font-size:11px;">${atrPct.toFixed(2)}%</span>`;
+        }
+
+        function formatPnL(pnlPct, inPosition) {
+            // Format P&L percentage for open positions
+            if (!inPosition) {
+                return '<span style="color:#8b949e;">--</span>';
+            }
+
+            let color;
+            if (pnlPct >= 5) {
+                color = '#3fb950';  // Strong green
+            } else if (pnlPct > 0) {
+                color = '#56d364';  // Light green
+            } else if (pnlPct <= -5) {
+                color = '#f85149';  // Strong red
+            } else {
+                color = '#f97583';  // Light red
+            }
+
+            const sign = pnlPct >= 0 ? '+' : '';
+            return `<span style="color:${color};font-weight:600;font-size:11px;">${sign}${pnlPct.toFixed(1)}%</span>`;
         }
 
         function formatSentiment(value) {
@@ -1719,33 +1822,38 @@ SECTORS_HTML = """
         <h1>Sector Analysis</h1>
         <div style="display: flex; gap: 8px;">
             <a href="/" class="nav-btn">← Dashboard</a>
-            <a href="/market-hours" class="nav-btn">MKT Hours</a>
+            <a href="/market" class="nav-btn">Market</a>
+            <a href="/models" class="nav-btn">Models</a>
         </div>
     </div>
 
     <div style="display:flex;justify-content:space-between;margin-bottom:20px;">
         <div style="display:flex;gap:8px;">
-            <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:6px 12px;text-align:center;">
-                <div style="font-size:16px;font-weight:700;color:#58a6ff;" id="total-stocks">--</div>
-                <div style="font-size:9px;color:#8b949e;">Stocks</div>
+            <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 16px;text-align:center;">
+                <div style="font-size:24px;font-weight:700;color:#58a6ff;" id="total-stocks">--</div>
+                <div style="font-size:11px;color:#8b949e;">Stocks</div>
             </div>
-            <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:6px 12px;text-align:center;">
-                <div style="font-size:16px;font-weight:700;color:#58a6ff;" id="total-sectors">--</div>
-                <div style="font-size:9px;color:#8b949e;">Sectors</div>
+            <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 16px;text-align:center;">
+                <div style="font-size:24px;font-weight:700;color:#58a6ff;" id="total-sectors">--</div>
+                <div style="font-size:11px;color:#8b949e;">Sectors</div>
             </div>
         </div>
         <div style="display:flex;gap:8px;">
-            <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:6px 12px;text-align:center;">
-                <div style="font-size:16px;font-weight:700;color:#3fb950;" id="total-invested">--</div>
-                <div style="font-size:9px;color:#8b949e;">Invested</div>
+            <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 16px;text-align:center;">
+                <div style="font-size:24px;font-weight:700;color:#3fb950;" id="total-invested">--</div>
+                <div style="font-size:11px;color:#8b949e;">Invested</div>
             </div>
-            <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:6px 12px;text-align:center;">
-                <div style="font-size:16px;font-weight:700;color:#3fb950;" id="total-positions">--</div>
-                <div style="font-size:9px;color:#8b949e;">Positions</div>
+            <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 16px;text-align:center;">
+                <div style="font-size:24px;font-weight:700;color:#3fb950;" id="total-positions">--</div>
+                <div style="font-size:11px;color:#8b949e;">Positions</div>
             </div>
-            <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:6px 12px;text-align:center;">
-                <div style="font-size:16px;font-weight:700;color:#f0883e;" id="portfolio-beta">--</div>
-                <div style="font-size:9px;color:#8b949e;">Beta</div>
+            <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 16px;text-align:center;">
+                <div style="font-size:24px;font-weight:700;" id="portfolio-sentiment">--</div>
+                <div style="font-size:11px;color:#8b949e;">Sentiment</div>
+            </div>
+            <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 16px;text-align:center;">
+                <div style="font-size:24px;font-weight:700;color:#f0883e;" id="portfolio-beta">--</div>
+                <div style="font-size:11px;color:#8b949e;">Beta</div>
             </div>
         </div>
     </div>
@@ -1810,6 +1918,7 @@ SECTORS_HTML = """
                 let totalInvested = 0;
                 let totalPositions = 0;
                 let weightedBetaSum = 0;
+                let weightedSentimentSum = 0;
 
                 data.stocks.forEach(stock => {
                     const sector = stock.category || 'UNCATEGORIZED';
@@ -1819,7 +1928,8 @@ SECTORS_HTML = """
                             invested: 0,
                             positions: 0,
                             stocks: [],
-                            betaWeightedSum: 0
+                            betaWeightedSum: 0,
+                            sentimentWeightedSum: 0
                         };
                     }
                     sectorData[sector].count++;
@@ -1837,6 +1947,13 @@ SECTORS_HTML = """
                         weightedBetaSum += beta * invested;
                     }
 
+                    // Calculate weighted sentiment contribution
+                    const sentiment = stock.news_sentiment || 0;
+                    if (invested > 0) {
+                        sectorData[sector].sentimentWeightedSum += sentiment * invested;
+                        weightedSentimentSum += sentiment * invested;
+                    }
+
                     if (stock.position > 0) {
                         sectorData[sector].positions++;
                         totalPositions++;
@@ -1845,11 +1962,14 @@ SECTORS_HTML = """
 
                 // Calculate portfolio weighted beta
                 const portfolioBeta = totalInvested > 0 ? (weightedBetaSum / totalInvested) : 0;
+                // Calculate portfolio weighted sentiment
+                const portfolioSentiment = totalInvested > 0 ? (weightedSentimentSum / totalInvested) : 0;
 
-                // Calculate sector weighted betas
+                // Calculate sector weighted betas and sentiments
                 Object.keys(sectorData).forEach(sector => {
                     const s = sectorData[sector];
                     s.weightedBeta = s.invested > 0 ? (s.betaWeightedSum / s.invested) : null;
+                    s.weightedSentiment = s.invested > 0 ? (s.sentimentWeightedSum / s.invested) : null;
                 });
 
                 // Update summary stats
@@ -1858,6 +1978,23 @@ SECTORS_HTML = """
                 document.getElementById('total-invested').textContent = '$' + formatNumber(totalInvested);
                 document.getElementById('total-positions').textContent = totalPositions;
                 document.getElementById('portfolio-beta').textContent = portfolioBeta > 0 ? portfolioBeta.toFixed(2) : '--';
+
+                // Update portfolio sentiment with color coding
+                const sentimentEl = document.getElementById('portfolio-sentiment');
+                if (totalInvested > 0) {
+                    const sentimentDisplay = (portfolioSentiment * 100).toFixed(0);
+                    sentimentEl.textContent = sentimentDisplay;
+                    if (portfolioSentiment >= 0.1) {
+                        sentimentEl.style.color = '#3fb950';  // green
+                    } else if (portfolioSentiment <= -0.1) {
+                        sentimentEl.style.color = '#f85149';  // red
+                    } else {
+                        sentimentEl.style.color = '#8b949e';  // neutral gray
+                    }
+                } else {
+                    sentimentEl.textContent = '--';
+                    sentimentEl.style.color = '#8b949e';
+                }
 
                 // Sort sectors by count
                 const sortedSectors = Object.entries(sectorData)
@@ -2178,7 +2315,9 @@ MARKET_HOURS_HTML = """
         <h1>Market Hours - Trading Clock</h1>
         <div style="display: flex; gap: 8px;">
             <a href="/" class="nav-btn">← Dashboard</a>
-            <a href="/sectors" class="nav-btn">Sectors</a>
+            <a href="/market" class="nav-btn">Market</a>
+            <a href="/models" class="nav-btn">Models</a>
+            <a href="/sectors" class="nav-btn">Sector/Portfolio</a>
         </div>
     </div>
 
@@ -2609,6 +2748,967 @@ MARKET_HOURS_HTML = """
 """
 
 
+MARKET_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Market State - URTH & Indicators</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+            background: #0d1117; color: #c9d1d9; padding: 20px;
+            font-size: 13px;
+        }
+        .header {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 20px; padding-bottom: 12px; border-bottom: 1px solid #30363d;
+        }
+        .header h1 { font-size: 18px; font-weight: 600; }
+        .nav-btn {
+            padding: 6px 14px; border-radius: 6px; font-size: 12px; font-weight: 600;
+            background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
+            text-decoration: none; transition: all 0.2s;
+        }
+        .nav-btn:hover { background: #30363d; border-color: #58a6ff; color: #58a6ff; }
+
+        .urth-section {
+            background: #161b22; border-radius: 8px; padding: 20px;
+            border: 1px solid #30363d; margin-bottom: 24px;
+        }
+        .urth-header {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 16px;
+        }
+        .urth-title {
+            display: flex; align-items: center; gap: 12px;
+        }
+        .urth-symbol {
+            font-size: 24px; font-weight: 700; color: #58a6ff;
+        }
+        .urth-name {
+            font-size: 12px; color: #8b949e;
+        }
+        .urth-price {
+            font-size: 32px; font-weight: 700;
+        }
+        .urth-change {
+            font-size: 16px; margin-left: 12px;
+        }
+        .urth-change.positive { color: #3fb950; }
+        .urth-change.negative { color: #f85149; }
+        .urth-stats {
+            display: flex; gap: 24px; font-size: 12px; color: #8b949e;
+        }
+        .urth-stats span { color: #c9d1d9; }
+
+        .chart-container {
+            height: 300px; position: relative;
+        }
+        .period-buttons {
+            display: flex; gap: 8px; margin-bottom: 12px;
+        }
+        .period-btn {
+            padding: 4px 12px; border: 1px solid #30363d; border-radius: 4px;
+            background: #0d1117; color: #8b949e; cursor: pointer; font-size: 12px;
+        }
+        .period-btn:hover { border-color: #58a6ff; color: #58a6ff; }
+        .period-btn.active { background: #238636; border-color: #238636; color: white; }
+
+        .section-title {
+            font-size: 16px; font-weight: 600; margin-bottom: 16px;
+            display: flex; align-items: center; gap: 8px;
+        }
+        .section-title .count {
+            background: #30363d; padding: 2px 8px; border-radius: 10px;
+            font-size: 11px; color: #8b949e;
+        }
+
+        .indicators-section {
+            margin-bottom: 24px;
+        }
+
+        .indicators-grid {
+            display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
+        }
+        .directional-grid {
+            display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px;
+        }
+        @media (max-width: 900px) {
+            .indicators-grid { grid-template-columns: repeat(2, 1fr); }
+            .directional-grid { grid-template-columns: 1fr; }
+        }
+        @media (max-width: 600px) {
+            .indicators-grid { grid-template-columns: 1fr; }
+        }
+
+        .indicator-card {
+            background: #161b22; border-radius: 8px; padding: 16px;
+            border: 1px solid #30363d;
+        }
+        .indicator-header {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 8px;
+        }
+        .indicator-name {
+            font-size: 11px; color: #8b949e; text-transform: uppercase;
+            font-weight: 600;
+        }
+        .indicator-badge {
+            padding: 4px 12px; border-radius: 4px; font-size: 12px;
+            font-weight: 700; text-transform: uppercase;
+        }
+        .indicator-source {
+            font-size: 10px; color: #6e7681; margin-top: 4px;
+        }
+        .indicator-desc {
+            font-size: 11px; color: #8b949e; margin-top: 4px;
+        }
+
+        .last-update {
+            text-align: center; color: #6e7681; font-size: 11px; margin-top: 20px;
+        }
+
+        .loading {
+            text-align: center; padding: 40px; color: #8b949e;
+        }
+        .error {
+            color: #f85149; background: rgba(248,81,73,0.1);
+            padding: 12px; border-radius: 6px; margin-bottom: 16px;
+        }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="header">
+        <h1>Market State</h1>
+        <div style="display: flex; gap: 8px;">
+            <a href="/" class="nav-btn">Dashboard</a>
+            <a href="/models" class="nav-btn">Models</a>
+            <a href="/sectors" class="nav-btn">Sector/Portfolio</a>
+        </div>
+    </div>
+
+    <div id="error-container"></div>
+
+    <!-- URTH Chart Section -->
+    <div class="urth-section">
+        <div class="urth-header">
+            <div class="urth-title">
+                <div>
+                    <div class="urth-symbol">URTH</div>
+                    <div class="urth-name">iShares MSCI World ETF</div>
+                </div>
+            </div>
+            <div style="text-align: right;">
+                <div>
+                    <span id="urth-price" class="urth-price">--</span>
+                    <span id="urth-change" class="urth-change">--</span>
+                </div>
+                <div class="urth-stats">
+                    <div>Vol: <span id="urth-volume">--</span></div>
+                    <div>Open: <span id="urth-open">--</span></div>
+                    <div>H/L: <span id="urth-range">--</span></div>
+                </div>
+            </div>
+        </div>
+        <div class="period-buttons">
+            <button class="period-btn" data-period="1d" data-interval="5m">1D</button>
+            <button class="period-btn" data-period="5d" data-interval="15m">1W</button>
+            <button class="period-btn active" data-period="1mo" data-interval="1d">1M</button>
+            <button class="period-btn" data-period="3mo" data-interval="1d">3M</button>
+            <button class="period-btn" data-period="1y" data-interval="1d">1Y</button>
+        </div>
+        <div class="chart-container">
+            <canvas id="urth-chart"></canvas>
+        </div>
+    </div>
+
+    <!-- Market Describers Section -->
+    <div class="indicators-section">
+        <div class="section-title">
+            Market Describers
+            <span class="count">9 indicators</span>
+        </div>
+        <div class="indicators-grid" id="market-describers">
+            <div class="loading">Loading market state...</div>
+        </div>
+        <!-- Historical Charts for Market Describers -->
+        <div style="margin-top: 20px; background: #161b22; border-radius: 8px; padding: 16px; border: 1px solid #30363d;">
+            <div style="font-size: 14px; font-weight: 600; margin-bottom: 12px; color: #8b949e;">
+                Historical Trends (1 Year)
+            </div>
+            <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px;">
+                <div style="height: 180px;"><canvas id="chart-volatility"></canvas></div>
+                <div style="height: 180px;"><canvas id="chart-rates"></canvas></div>
+                <div style="height: 180px;"><canvas id="chart-yield-curve"></canvas></div>
+                <div style="height: 180px;"><canvas id="chart-trend"></canvas></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Directional Describers Section -->
+    <div class="indicators-section">
+        <div class="section-title">
+            Directional Describers
+            <span class="count">4 indicators</span>
+        </div>
+        <div class="directional-grid" id="directional-describers">
+            <div class="loading">Loading...</div>
+        </div>
+        <!-- Historical Charts for Directional Describers -->
+        <div style="margin-top: 20px; background: #161b22; border-radius: 8px; padding: 16px; border: 1px solid #30363d;">
+            <div style="font-size: 14px; font-weight: 600; margin-bottom: 12px; color: #8b949e;">
+                Sector Performance vs SPY (1 Year)
+            </div>
+            <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px;">
+                <div style="height: 180px;"><canvas id="chart-sectors"></canvas></div>
+                <div style="height: 180px;"><canvas id="chart-risk-appetite"></canvas></div>
+            </div>
+        </div>
+    </div>
+
+    <div id="last-update" class="last-update">Last updated: --</div>
+
+    <script>
+        let urthChart = null;
+        let currentPeriod = '1mo';
+        let currentInterval = '1d';
+
+        // Format number with commas
+        function formatNumber(num) {
+            if (num >= 1e9) return (num / 1e9).toFixed(2) + 'B';
+            if (num >= 1e6) return (num / 1e6).toFixed(2) + 'M';
+            if (num >= 1e3) return (num / 1e3).toFixed(1) + 'K';
+            return num.toLocaleString();
+        }
+
+        // Render indicator card
+        function renderIndicatorCard(key, data) {
+            const name = key.replace(/_/g, ' ').replace(/regime|rotation/gi, '').trim();
+            return `
+                <div class="indicator-card">
+                    <div class="indicator-header">
+                        <span class="indicator-name">${name}</span>
+                        <span class="indicator-badge" style="background: ${data.color}20; color: ${data.color}; border: 1px solid ${data.color};">
+                            ${data.value}
+                        </span>
+                    </div>
+                    <div class="indicator-source">${data.source || ''}</div>
+                    <div class="indicator-desc">${data.description || ''}</div>
+                </div>
+            `;
+        }
+
+        // Load market state
+        async function loadMarketState() {
+            try {
+                const resp = await fetch('/api/market/state');
+                const data = await resp.json();
+
+                if (data.error) {
+                    document.getElementById('error-container').innerHTML =
+                        `<div class="error">${data.error}</div>`;
+                    return;
+                }
+
+                // Update URTH data
+                if (data.urth) {
+                    const urth = data.urth;
+                    document.getElementById('urth-price').textContent = '$' + (urth.price || 0).toFixed(2);
+
+                    const changeEl = document.getElementById('urth-change');
+                    const change = urth.change || 0;
+                    const changePct = urth.change_pct || 0;
+                    changeEl.textContent = `${change >= 0 ? '+' : ''}${change.toFixed(2)} (${changePct >= 0 ? '+' : ''}${changePct.toFixed(2)}%)`;
+                    changeEl.className = 'urth-change ' + (change >= 0 ? 'positive' : 'negative');
+
+                    document.getElementById('urth-volume').textContent = formatNumber(urth.volume || 0);
+                    document.getElementById('urth-open').textContent = '$' + (urth.open || 0).toFixed(2);
+                    document.getElementById('urth-range').textContent =
+                        '$' + (urth.low || 0).toFixed(2) + ' - $' + (urth.high || 0).toFixed(2);
+                }
+
+                // Render Market Describers
+                const marketDescribers = data.market_describers || {};
+                const marketGrid = document.getElementById('market-describers');
+                const describerOrder = [
+                    'trend_regime', 'volatility_regime', 'market_breadth',
+                    'news_sentiment', 'earnings_density', 'rates_regime',
+                    'yield_curve', 'correlation_regime', 'dispersion_regime'
+                ];
+                marketGrid.innerHTML = describerOrder
+                    .filter(key => marketDescribers[key])
+                    .map(key => renderIndicatorCard(key, marketDescribers[key]))
+                    .join('');
+
+                // Render Directional Describers
+                const directionalDescribers = data.directional_describers || {};
+                const directionalGrid = document.getElementById('directional-describers');
+                const directionalOrder = [
+                    'factor_rotation', 'sector_rotation',
+                    'sector_momentum', 'risk_appetite'
+                ];
+                directionalGrid.innerHTML = directionalOrder
+                    .filter(key => directionalDescribers[key])
+                    .map(key => renderIndicatorCard(key, directionalDescribers[key]))
+                    .join('');
+
+                // Update timestamp
+                document.getElementById('last-update').textContent =
+                    'Last updated: ' + new Date(data.last_updated).toLocaleTimeString();
+
+            } catch (e) {
+                console.error('Error loading market state:', e);
+                document.getElementById('error-container').innerHTML =
+                    `<div class="error">Failed to load market state: ${e.message}</div>`;
+            }
+        }
+
+        // Calculate rolling volatility from prices
+        function calculateVolatility(prices, window = 10) {
+            const volatility = [];
+            for (let i = 0; i < prices.length; i++) {
+                if (i < window) {
+                    volatility.push(null);
+                } else {
+                    // Calculate returns for window
+                    const returns = [];
+                    for (let j = i - window + 1; j <= i; j++) {
+                        if (prices[j-1] > 0) {
+                            returns.push((prices[j] - prices[j-1]) / prices[j-1]);
+                        }
+                    }
+                    // Standard deviation of returns * sqrt(252) for annualized vol
+                    if (returns.length > 0) {
+                        const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
+                        const variance = returns.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / returns.length;
+                        const dailyVol = Math.sqrt(variance);
+                        const annualizedVol = dailyVol * Math.sqrt(252) * 100; // as percentage
+                        volatility.push(annualizedVol);
+                    } else {
+                        volatility.push(null);
+                    }
+                }
+            }
+            return volatility;
+        }
+
+        // Load URTH chart with volatility overlay
+        async function loadUrthChart(period, interval) {
+            try {
+                const resp = await fetch(`/api/stock/URTH/history?period=${period}&interval=${interval}`);
+                const data = await resp.json();
+
+                if (!data.data || data.data.length === 0) {
+                    console.error('No chart data');
+                    return;
+                }
+
+                const labels = data.data.map(d => {
+                    const date = new Date(d.date);
+                    return period === '1d' ? date.toLocaleTimeString('en-US', {hour: '2-digit', minute: '2-digit'})
+                                           : date.toLocaleDateString('en-US', {month: 'short', day: 'numeric'});
+                });
+                const prices = data.data.map(d => d.close);
+
+                // Calculate volatility
+                const volWindow = period === '1d' ? 5 : (period === '5d' ? 8 : 10);
+                const volatility = calculateVolatility(prices, volWindow);
+
+                const ctx = document.getElementById('urth-chart').getContext('2d');
+
+                if (urthChart) {
+                    urthChart.destroy();
+                }
+
+                const gradient = ctx.createLinearGradient(0, 0, 0, 300);
+                const isPositive = prices[prices.length - 1] >= prices[0];
+                if (isPositive) {
+                    gradient.addColorStop(0, 'rgba(63, 185, 80, 0.3)');
+                    gradient.addColorStop(1, 'rgba(63, 185, 80, 0)');
+                } else {
+                    gradient.addColorStop(0, 'rgba(248, 81, 73, 0.3)');
+                    gradient.addColorStop(1, 'rgba(248, 81, 73, 0)');
+                }
+
+                urthChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: labels,
+                        datasets: [
+                            {
+                                label: 'URTH Price',
+                                data: prices,
+                                borderColor: isPositive ? '#3fb950' : '#f85149',
+                                backgroundColor: gradient,
+                                borderWidth: 2,
+                                fill: true,
+                                tension: 0.1,
+                                pointRadius: 0,
+                                pointHoverRadius: 4,
+                                yAxisID: 'y'
+                            },
+                            {
+                                label: 'Volatility',
+                                data: volatility,
+                                borderColor: '#a371f7',
+                                backgroundColor: 'transparent',
+                                borderWidth: 1.5,
+                                borderDash: [5, 5],
+                                fill: false,
+                                tension: 0.3,
+                                pointRadius: 0,
+                                pointHoverRadius: 3,
+                                yAxisID: 'y1'
+                            }
+                        ]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: {
+                                display: true,
+                                position: 'top',
+                                labels: {
+                                    color: '#8b949e',
+                                    boxWidth: 12,
+                                    padding: 10,
+                                    font: { size: 11 }
+                                }
+                            },
+                            tooltip: {
+                                mode: 'index',
+                                intersect: false,
+                                backgroundColor: '#161b22',
+                                titleColor: '#c9d1d9',
+                                bodyColor: '#c9d1d9',
+                                borderColor: '#30363d',
+                                borderWidth: 1,
+                                callbacks: {
+                                    label: function(context) {
+                                        if (context.datasetIndex === 0) {
+                                            return 'Price: $' + context.parsed.y.toFixed(2);
+                                        } else {
+                                            return 'Vol: ' + (context.parsed.y ? context.parsed.y.toFixed(1) + '%' : 'N/A');
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        scales: {
+                            x: {
+                                grid: { color: '#21262d' },
+                                ticks: { color: '#8b949e', maxTicksLimit: 8 }
+                            },
+                            y: {
+                                type: 'linear',
+                                display: true,
+                                position: 'left',
+                                grid: { color: '#21262d' },
+                                ticks: {
+                                    color: '#8b949e',
+                                    callback: function(value) { return '$' + value.toFixed(0); }
+                                },
+                                title: {
+                                    display: true,
+                                    text: 'Price ($)',
+                                    color: '#8b949e',
+                                    font: { size: 10 }
+                                }
+                            },
+                            y1: {
+                                type: 'linear',
+                                display: true,
+                                position: 'right',
+                                grid: { drawOnChartArea: false },
+                                ticks: {
+                                    color: '#a371f7',
+                                    callback: function(value) { return value.toFixed(0) + '%'; }
+                                },
+                                title: {
+                                    display: true,
+                                    text: 'Volatility (%)',
+                                    color: '#a371f7',
+                                    font: { size: 10 }
+                                }
+                            }
+                        },
+                        interaction: {
+                            mode: 'nearest',
+                            axis: 'x',
+                            intersect: false
+                        }
+                    }
+                });
+            } catch (e) {
+                console.error('Error loading URTH chart:', e);
+            }
+        }
+
+        // Period button handlers
+        document.querySelectorAll('.period-btn').forEach(btn => {
+            btn.addEventListener('click', function() {
+                document.querySelectorAll('.period-btn').forEach(b => b.classList.remove('active'));
+                this.classList.add('active');
+                currentPeriod = this.dataset.period;
+                currentInterval = this.dataset.interval;
+                loadUrthChart(currentPeriod, currentInterval);
+            });
+        });
+
+        // Historical charts storage
+        let historyCharts = {};
+
+        // Create a simple line chart for historical data
+        function createHistoryChart(canvasId, data, title, color, unit = '') {
+            const ctx = document.getElementById(canvasId);
+            if (!ctx) return;
+
+            // Destroy existing chart if any
+            if (historyCharts[canvasId]) {
+                historyCharts[canvasId].destroy();
+            }
+
+            if (!data || data.length === 0) {
+                ctx.getContext('2d').fillStyle = '#8b949e';
+                ctx.getContext('2d').font = '12px sans-serif';
+                ctx.getContext('2d').fillText('No data available', 50, 80);
+                return;
+            }
+
+            // Sample data if too many points
+            const maxPoints = 100;
+            let sampledData = data;
+            if (data.length > maxPoints) {
+                const step = Math.ceil(data.length / maxPoints);
+                sampledData = data.filter((_, i) => i % step === 0);
+            }
+
+            const labels = sampledData.map(d => {
+                const date = new Date(d.date);
+                return date.toLocaleDateString('en-US', {month: 'short', day: 'numeric'});
+            });
+            const values = sampledData.map(d => d.value);
+
+            historyCharts[canvasId] = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: title,
+                        data: values,
+                        borderColor: color,
+                        backgroundColor: color + '20',
+                        borderWidth: 1.5,
+                        fill: true,
+                        tension: 0.3,
+                        pointRadius: 0,
+                        pointHoverRadius: 3
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: true,
+                            position: 'top',
+                            labels: { color: '#8b949e', boxWidth: 10, font: { size: 10 } }
+                        },
+                        tooltip: {
+                            mode: 'index',
+                            intersect: false,
+                            backgroundColor: '#161b22',
+                            titleColor: '#c9d1d9',
+                            bodyColor: '#c9d1d9',
+                            borderColor: '#30363d',
+                            borderWidth: 1,
+                            callbacks: {
+                                label: function(context) {
+                                    return context.parsed.y.toFixed(2) + unit;
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            grid: { color: '#21262d' },
+                            ticks: { color: '#6e7681', maxTicksLimit: 6, font: { size: 9 } }
+                        },
+                        y: {
+                            grid: { color: '#21262d' },
+                            ticks: {
+                                color: '#6e7681',
+                                font: { size: 9 },
+                                callback: function(value) { return value.toFixed(1) + unit; }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Create multi-line chart for Treasury Yields
+        function createTreasuryChart(canvasId, yieldsData) {
+            const ctx = document.getElementById(canvasId);
+            if (!ctx) return;
+
+            if (historyCharts[canvasId]) {
+                historyCharts[canvasId].destroy();
+            }
+
+            const colors = {
+                '2Y': '#3fb950',   // green
+                '5Y': '#a371f7',   // purple
+                '10Y': '#58a6ff',  // blue
+                '30Y': '#f0883e'   // orange
+            };
+            const datasets = [];
+
+            for (const [maturity, data] of Object.entries(yieldsData)) {
+                if (!data.data || data.data.length === 0) continue;
+
+                // Sample data
+                const maxPoints = 100;
+                let sampledData = data.data;
+                if (data.data.length > maxPoints) {
+                    const step = Math.ceil(data.data.length / maxPoints);
+                    sampledData = data.data.filter((_, idx) => idx % step === 0);
+                }
+
+                datasets.push({
+                    label: maturity,
+                    data: sampledData.map(d => d.value),
+                    borderColor: colors[maturity] || '#8b949e',
+                    backgroundColor: 'transparent',
+                    borderWidth: 1.5,
+                    tension: 0.3,
+                    pointRadius: 0
+                });
+            }
+
+            if (datasets.length === 0) return;
+
+            // Use first dataset's dates as labels
+            const firstYield = Object.values(yieldsData)[0];
+            let sampledLabels = firstYield.data;
+            if (firstYield.data.length > 100) {
+                const step = Math.ceil(firstYield.data.length / 100);
+                sampledLabels = firstYield.data.filter((_, idx) => idx % step === 0);
+            }
+            const labels = sampledLabels.map(d => {
+                const date = new Date(d.date);
+                return date.toLocaleDateString('en-US', {month: 'short', day: 'numeric'});
+            });
+
+            historyCharts[canvasId] = new Chart(ctx, {
+                type: 'line',
+                data: { labels: labels, datasets: datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: true,
+                            position: 'top',
+                            labels: { color: '#8b949e', boxWidth: 8, font: { size: 9 }, padding: 8 }
+                        },
+                        tooltip: {
+                            mode: 'index',
+                            intersect: false,
+                            backgroundColor: '#161b22',
+                            titleColor: '#c9d1d9',
+                            bodyColor: '#c9d1d9',
+                            borderColor: '#30363d',
+                            borderWidth: 1,
+                            callbacks: {
+                                label: function(context) {
+                                    return context.dataset.label + ': ' + context.parsed.y.toFixed(2) + '%';
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            grid: { color: '#21262d' },
+                            ticks: { color: '#6e7681', maxTicksLimit: 6, font: { size: 9 } }
+                        },
+                        y: {
+                            grid: { color: '#21262d' },
+                            ticks: {
+                                color: '#6e7681',
+                                font: { size: 9 },
+                                callback: function(value) { return value.toFixed(1) + '%'; }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Create dual-line chart for SPY vs URTH trend
+        function createTrendComparisonChart(canvasId, trendData) {
+            const ctx = document.getElementById(canvasId);
+            if (!ctx) return;
+
+            if (historyCharts[canvasId]) {
+                historyCharts[canvasId].destroy();
+            }
+
+            const colors = {
+                'spy': '#3fb950',   // green for SPY
+                'urth': '#58a6ff'   // blue for URTH
+            };
+            const labels_map = {
+                'spy': 'SPY',
+                'urth': 'URTH'
+            };
+            const datasets = [];
+
+            for (const [key, data] of Object.entries(trendData)) {
+                if (!data.data || data.data.length === 0) continue;
+
+                // Sample data
+                const maxPoints = 100;
+                let sampledData = data.data;
+                if (data.data.length > maxPoints) {
+                    const step = Math.ceil(data.data.length / maxPoints);
+                    sampledData = data.data.filter((_, idx) => idx % step === 0);
+                }
+
+                datasets.push({
+                    label: labels_map[key] || key.toUpperCase(),
+                    data: sampledData.map(d => d.value),
+                    borderColor: colors[key] || '#8b949e',
+                    backgroundColor: 'transparent',
+                    borderWidth: 1.5,
+                    tension: 0.3,
+                    pointRadius: 0
+                });
+            }
+
+            if (datasets.length === 0) return;
+
+            // Use first dataset's dates as labels
+            const firstTrend = Object.values(trendData)[0];
+            let sampledLabels = firstTrend.data;
+            if (firstTrend.data.length > 100) {
+                const step = Math.ceil(firstTrend.data.length / 100);
+                sampledLabels = firstTrend.data.filter((_, idx) => idx % step === 0);
+            }
+            const labels = sampledLabels.map(d => {
+                const date = new Date(d.date);
+                return date.toLocaleDateString('en-US', {month: 'short', day: 'numeric'});
+            });
+
+            historyCharts[canvasId] = new Chart(ctx, {
+                type: 'line',
+                data: { labels: labels, datasets: datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: true,
+                            position: 'top',
+                            labels: { color: '#8b949e', boxWidth: 8, font: { size: 9 }, padding: 8 }
+                        },
+                        tooltip: {
+                            mode: 'index',
+                            intersect: false,
+                            backgroundColor: '#161b22',
+                            titleColor: '#c9d1d9',
+                            bodyColor: '#c9d1d9',
+                            borderColor: '#30363d',
+                            borderWidth: 1,
+                            callbacks: {
+                                label: function(context) {
+                                    return context.dataset.label + ' MA20/MA50: ' + context.parsed.y.toFixed(2) + '%';
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            grid: { color: '#21262d' },
+                            ticks: { color: '#6e7681', maxTicksLimit: 6, font: { size: 9 } }
+                        },
+                        y: {
+                            grid: { color: '#21262d' },
+                            ticks: {
+                                color: '#6e7681',
+                                font: { size: 9 },
+                                callback: function(value) { return value.toFixed(1) + '%'; }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Create multi-line chart for sectors
+        function createSectorsChart(canvasId, sectorsData) {
+            const ctx = document.getElementById(canvasId);
+            if (!ctx) return;
+
+            if (historyCharts[canvasId]) {
+                historyCharts[canvasId].destroy();
+            }
+
+            const datasets = [];
+            const colors = ['#3fb950', '#58a6ff', '#f0883e', '#a371f7'];
+            let i = 0;
+
+            for (const [key, sector] of Object.entries(sectorsData)) {
+                if (!sector.data || sector.data.length === 0) continue;
+
+                // Sample data
+                const maxPoints = 100;
+                let sampledData = sector.data;
+                if (sector.data.length > maxPoints) {
+                    const step = Math.ceil(sector.data.length / maxPoints);
+                    sampledData = sector.data.filter((_, idx) => idx % step === 0);
+                }
+
+                datasets.push({
+                    label: sector.name,
+                    data: sampledData.map(d => d.value),
+                    borderColor: colors[i % colors.length],
+                    backgroundColor: 'transparent',
+                    borderWidth: 1.5,
+                    tension: 0.3,
+                    pointRadius: 0
+                });
+                i++;
+            }
+
+            if (datasets.length === 0) return;
+
+            // Use first dataset's dates as labels
+            const firstSector = Object.values(sectorsData)[0];
+            let sampledLabels = firstSector.data;
+            if (firstSector.data.length > 100) {
+                const step = Math.ceil(firstSector.data.length / 100);
+                sampledLabels = firstSector.data.filter((_, idx) => idx % step === 0);
+            }
+            const labels = sampledLabels.map(d => {
+                const date = new Date(d.date);
+                return date.toLocaleDateString('en-US', {month: 'short', day: 'numeric'});
+            });
+
+            historyCharts[canvasId] = new Chart(ctx, {
+                type: 'line',
+                data: { labels: labels, datasets: datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: true,
+                            position: 'top',
+                            labels: { color: '#8b949e', boxWidth: 8, font: { size: 9 }, padding: 8 }
+                        },
+                        tooltip: {
+                            mode: 'index',
+                            intersect: false,
+                            backgroundColor: '#161b22',
+                            titleColor: '#c9d1d9',
+                            bodyColor: '#c9d1d9',
+                            borderColor: '#30363d',
+                            borderWidth: 1
+                        }
+                    },
+                    scales: {
+                        x: {
+                            grid: { color: '#21262d' },
+                            ticks: { color: '#6e7681', maxTicksLimit: 6, font: { size: 9 } }
+                        },
+                        y: {
+                            grid: { color: '#21262d' },
+                            ticks: {
+                                color: '#6e7681',
+                                font: { size: 9 },
+                                callback: function(value) { return value.toFixed(0) + '%'; }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Load historical data and render charts
+        async function loadHistoricalCharts() {
+            try {
+                const resp = await fetch('/api/market/history?period=1y');
+                const data = await resp.json();
+
+                if (data.error) {
+                    console.error('Historical data error:', data.error);
+                    return;
+                }
+
+                // Market Describers Charts
+                const md = data.market_describers || {};
+                if (md.volatility) {
+                    createHistoryChart('chart-volatility', md.volatility.data, md.volatility.name, md.volatility.color, '');
+                }
+                // Use multi-line Treasury yields chart if available, else fall back to single-line
+                if (md.treasury_yields) {
+                    createTreasuryChart('chart-rates', md.treasury_yields);
+                } else if (md.rates) {
+                    createHistoryChart('chart-rates', md.rates.data, md.rates.name, md.rates.color, '%');
+                }
+                if (md.yield_curve) {
+                    createHistoryChart('chart-yield-curve', md.yield_curve.data, md.yield_curve.name, md.yield_curve.color, '%');
+                }
+                // Use SPY vs URTH comparison chart if available, else fall back to single-line
+                if (md.trend_comparison) {
+                    createTrendComparisonChart('chart-trend', md.trend_comparison);
+                } else if (md.trend) {
+                    createHistoryChart('chart-trend', md.trend.data, md.trend.name, md.trend.color, '%');
+                }
+
+                // Directional Describers Charts
+                const dd = data.directional_describers || {};
+
+                // Sectors chart (multi-line)
+                const sectorData = {};
+                for (const [key, value] of Object.entries(dd)) {
+                    if (key.startsWith('sector_')) {
+                        sectorData[key] = value;
+                    }
+                }
+                if (Object.keys(sectorData).length > 0) {
+                    createSectorsChart('chart-sectors', sectorData);
+                }
+
+                // Risk appetite chart
+                if (dd.risk_appetite) {
+                    createHistoryChart('chart-risk-appetite', dd.risk_appetite.data, dd.risk_appetite.name, dd.risk_appetite.color, '');
+                }
+
+            } catch (e) {
+                console.error('Error loading historical charts:', e);
+            }
+        }
+
+        // Initialize
+        loadMarketState();
+        loadUrthChart(currentPeriod, currentInterval);
+        loadHistoricalCharts();
+
+        // Refresh every 30 seconds
+        setInterval(loadMarketState, 30000);
+    </script>
+</body>
+</html>
+"""
+
+
 def sanitize_floats(obj):
     """Replace NaN and Infinity with None to make JSON-serializable"""
     import math
@@ -2683,6 +3783,11 @@ async def get_sectors():
 @app.get("/market-hours", response_class=HTMLResponse)
 async def get_market_hours():
     return MARKET_HOURS_HTML
+
+
+@app.get("/market", response_class=HTMLResponse)
+async def get_market():
+    return MARKET_HTML
 
 
 @app.get("/alpha-cake", response_class=HTMLResponse)
@@ -2945,7 +4050,12 @@ async def get_alpha_cake():
     </style>
 </head>
 <body>
-    <a href="/" class="nav-btn">← Dashboard</a>
+    <div style="display: flex; gap: 8px; margin-bottom: 16px;">
+        <a href="/" class="nav-btn">← Dashboard</a>
+        <a href="/market" class="nav-btn">Market</a>
+        <a href="/models" class="nav-btn">Models</a>
+        <a href="/sectors" class="nav-btn">Sector/Portfolio</a>
+    </div>
 
     <div class="header">
         <svg width="600" viewBox="0 0 680 200" xmlns="http://www.w3.org/2000/svg" style="margin-bottom: 10px;">
@@ -3400,7 +4510,12 @@ async def get_models():
     </style>
 </head>
 <body>
-    <a href="/" class="nav-btn">Back to Dashboard</a>
+    <div style="display: flex; gap: 8px; margin-bottom: 16px;">
+        <a href="/" class="nav-btn">← Dashboard</a>
+        <a href="/market" class="nav-btn">Market</a>
+        <a href="/alpha-cake" class="nav-btn">Beta</a>
+        <a href="/sectors" class="nav-btn">Sector/Portfolio</a>
+    </div>
 
     <div class="header">
         <div>
@@ -3589,6 +4704,28 @@ async def health_check():
 async def get_trading_status():
     """Get current trading control status"""
     return trading_control.get_state()
+
+
+@app.get("/api/market/state")
+async def get_market_state():
+    """Get comprehensive market state with all indicators"""
+    import asyncio
+    # Update stock data from current bot state
+    try:
+        state = await asyncio.to_thread(read_state_file)
+        if state and 'stocks' in state:
+            market_engine.update_stock_data(state['stocks'])
+    except Exception as e:
+        pass  # Use cached data if refresh fails
+
+    return market_engine.get_state()
+
+
+@app.get("/api/market/history")
+async def get_market_history(period: str = "1y"):
+    """Get historical data for market indicators"""
+    import asyncio
+    return await asyncio.to_thread(market_engine.get_historical_indicators, period)
 
 
 @app.post("/api/trading/toggle")
