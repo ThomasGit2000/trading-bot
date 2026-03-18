@@ -119,7 +119,7 @@ DASHBOARD_HTML = """
 
         .signal-bar {
             width: 80px; height: 8px;
-            background: linear-gradient(90deg, #da3633 0%, #8b949e 50%, #238636 100%);
+            background: linear-gradient(90deg, #238636 0%, #8b949e 50%, #da3633 100%);
             border-radius: 4px; position: relative; display: inline-block;
         }
         .signal-indicator {
