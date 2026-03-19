@@ -456,6 +456,7 @@ class MultiStockBot:
             self.selective_rsi = SelectiveRSIStrategy(SelectiveRSIConfig(
                 rsi_period=int(os.getenv('SELECTIVE_RSI_PERIOD', '14')),
                 rsi_oversold=float(os.getenv('SELECTIVE_RSI_OVERSOLD', '25')),
+                rsi_oversold_bear=float(os.getenv('SELECTIVE_RSI_OVERSOLD_BEAR', '15')),
                 rsi_overbought=float(os.getenv('SELECTIVE_RSI_OVERBOUGHT', '70')),
                 volume_multiplier=float(os.getenv('SELECTIVE_VOLUME_MULT', '1.0')),
                 atr_min_pct=float(os.getenv('SELECTIVE_ATR_MIN', '0.01')),
@@ -464,7 +465,8 @@ class MultiStockBot:
                 max_positions=int(os.getenv('SELECTIVE_MAX_POSITIONS', '5'))
             ))
             self.selective_positions = {}  # symbol -> {'entry': price, 'shares': int}
-            logger.info(f"Selective RSI Strategy: RSI<{self.selective_rsi.config.rsi_oversold}, "
+            logger.info(f"Selective RSI Strategy: RSI<{self.selective_rsi.config.rsi_oversold} (BULL), "
+                       f"RSI<{self.selective_rsi.config.rsi_oversold_bear} (BEAR), "
                        f"Vol>{self.selective_rsi.config.volume_multiplier}x, "
                        f"Target {self.selective_rsi.config.profit_target_pct*100:.0f}%, "
                        f"Stop {self.selective_rsi.config.stop_loss_pct*100:.0f}%")
@@ -1349,12 +1351,18 @@ class MultiStockBot:
         if len(self.selective_positions) >= self.selective_rsi.config.max_positions:
             return
 
-        # Check entry signal
-        should_buy, context = self.selective_rsi.check_entry_signal(symbol)
+        # Get current market regime for adaptive thresholds
+        current_regime = "NEUTRAL"
+        if self.regime_detector:
+            current_regime = self.regime_detector.get_regime()
+
+        # Check entry signal with regime-adjusted thresholds
+        should_buy, context = self.selective_rsi.check_entry_signal(symbol, regime=current_regime)
 
         # Log when RSI is low but filters block (useful for debugging)
         rsi = context.get('rsi')
-        if rsi is not None and rsi < self.selective_rsi.config.rsi_oversold and not should_buy:
+        rsi_threshold = context.get('rsi_threshold', self.selective_rsi.config.rsi_oversold)
+        if rsi is not None and rsi < rsi_threshold + 10 and not should_buy:
             logger.info(f"[SELECTIVE RSI] {symbol}: RSI={rsi:.1f} but BLOCKED: {context.get('reason', 'unknown')}")
 
         if should_buy:
@@ -1950,7 +1958,11 @@ class MultiStockBot:
                 # Set signal and strength based on RSI
                 # Signal bar position matches RSI: low RSI = left (green/BUY), high RSI = right (red/SELL)
                 if rsi is not None:
-                    oversold = self.selective_rsi.config.rsi_oversold  # 25
+                    # Regime-adjusted oversold threshold: stricter in bear markets
+                    if current_regime == "BEAR":
+                        oversold = self.selective_rsi.config.rsi_oversold_bear  # 15 in bear
+                    else:
+                        oversold = self.selective_rsi.config.rsi_oversold  # 25 in bull/neutral
                     overbought = self.selective_rsi.config.rsi_overbought  # 70
 
                     if rsi < oversold:

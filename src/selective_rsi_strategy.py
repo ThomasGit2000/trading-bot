@@ -23,7 +23,8 @@ from typing import Optional, Dict, List, Tuple
 class SelectiveRSIConfig:
     """Configuration for Selective RSI Strategy."""
     rsi_period: int = 14
-    rsi_oversold: float = 25.0      # Buy when RSI < this
+    rsi_oversold: float = 25.0      # Buy when RSI < this (BULL/NEUTRAL)
+    rsi_oversold_bear: float = 15.0 # Buy when RSI < this (BEAR market - stricter)
     rsi_overbought: float = 70.0    # Sell when RSI > this
     volume_multiplier: float = 1.0  # Min relative volume
     atr_min_pct: float = 0.01       # Min ATR as % of price (1%)
@@ -302,9 +303,13 @@ class SelectiveRSIStrategy:
             return None
         return self.prices[symbol][-1]
 
-    def check_entry_signal(self, symbol: str) -> Tuple[bool, Dict]:
+    def check_entry_signal(self, symbol: str, regime: str = "NEUTRAL") -> Tuple[bool, Dict]:
         """
         Check if symbol has valid entry signal.
+
+        Args:
+            symbol: Stock symbol
+            regime: Market regime ("BULL", "BEAR", or "NEUTRAL")
 
         Returns:
             (should_buy, context_dict)
@@ -314,10 +319,18 @@ class SelectiveRSIStrategy:
         rel_vol = self.compute_relative_volume(symbol)
         atr_pct = self.compute_atr_pct(symbol)
 
+        # Regime-adjusted RSI threshold: stricter in bear markets
+        if regime == "BEAR":
+            rsi_threshold = self.config.rsi_oversold_bear  # 15 in bear
+        else:
+            rsi_threshold = self.config.rsi_oversold  # 25 in bull/neutral
+
         context = {
             'rsi': rsi,
             'rel_vol': rel_vol,
             'atr_pct': atr_pct,
+            'regime': regime,
+            'rsi_threshold': rsi_threshold,
             'filters_passed': False,
             'reason': ''
         }
@@ -327,8 +340,8 @@ class SelectiveRSIStrategy:
             context['reason'] = 'Insufficient data for RSI'
             return False, context
 
-        if rsi >= self.config.rsi_oversold:
-            context['reason'] = f'RSI {rsi:.1f} >= {self.config.rsi_oversold}'
+        if rsi >= rsi_threshold:
+            context['reason'] = f'RSI {rsi:.1f} >= {rsi_threshold} ({regime})'
             return False, context
 
         if rel_vol is None:
