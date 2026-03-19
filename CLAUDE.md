@@ -4,15 +4,18 @@
 Automated multi-stock trading bot for Interactive Brokers.
 Now supports **70 momentum stocks** with multiple trading strategies.
 
-## Current State (Last updated: 2026-03-16)
-- **Active Model**: SCALP_TICK (mean-reversion scalping)
-- **Strategy**: Buy dips (0.20% drop), target 0.18%, stop 0.12%
-- **Stock Universe**: 70 hand-picked momentum stocks
+## Current State (Last updated: 2026-03-18)
+- **Active Model**: SELECTIVE_RSI (mean-reversion with volume confirmation)
+- **Strategy**: Buy oversold (RSI<25) with volume spike + ATR filter, target +12%, stop -8%
+- **Backtest**: 65.2% win rate, +$192/14 days = $14/day = 48% annualized
+- **Stock Universe**: 71 momentum stocks
 - **Processing**: Per-tick with multi-core parallel computation (12 workers)
 - **News Analysis**: VADER sentiment (industry-standard NLP)
-- **Risk Controls**: 5% stop-loss, 3% trailing stop, 60s trade cooldown
+- **Risk Controls**: 8% stop-loss, 12% profit target, max 5 concurrent positions
 - **Trading Hours**: Regular market only (9:30 AM - 4:00 PM ET)
+- **Dashboard**: http://localhost:8080 (updated columns for SELECTIVE_RSI)
 - **Model Switching**: http://localhost:8080/models
+- **Market Overview**: http://localhost:8080/market
 - Live trading mode configured (port 7496 for TWS)
 
 ## Stock Universe (70 Stocks)
@@ -33,23 +36,36 @@ Currently trading 70 momentum stocks across multiple sectors:
 - **Materials/Energy**: LIN, FCX, XOM, CVX, ENPH
 - **Other**: BABA, TMUS, ORLY, DHI, PGR
 
-## Strategy: BREAKOUT
+## Strategy: SELECTIVE_RSI (Active)
 
-**Price breakout detection** optimized for 1-second tick data.
+**Mean reversion strategy** buying oversold stocks with volume confirmation.
 
-### Entry/Exit Rules:
-- **BUY Signal**: Price breaks **0.5% above** 60-period high
-- **SELL Signal**: Price breaks **0.5% below** 60-period low (or stop-loss/trailing stop triggers)
-- **ATR Filter**: Only trades when ATR > 0.20% (filters low volatility)
+### Entry Rules:
+- **RSI < 25**: Stock is oversold (buy zone)
+- **Relative Volume > 1.0x**: Volume confirmation vs average
+- **ATR > 1%**: Sufficient volatility for profitable moves
+- **Max 5 positions**: Capital allocation limit
 
-### Risk Management (ACTIVE):
-- **5% Stop-Loss**: Cuts losses at -5% per trade
-- **3% Trailing Stop**: Locks in profits after gains
-- **Minimum Hold**: 5 periods
+### Exit Rules:
+- **RSI > 70**: Stock is overbought (sell)
+- **+12% Profit Target**: Take profits
+- **-8% Stop Loss**: Cut losses
 
-### Circuit Breakers:
-- **Max Daily Loss**: $1,000 (14% of account)
-- **Max Daily Trades**: 100 trades
+### Dashboard Columns:
+| Column | Description | Color Coding |
+|--------|-------------|--------------|
+| RSI | Current RSI value | Green < 25, Red > 70 |
+| Rel Vol | Volume vs average | Green ≥ 1.0x |
+| ATR% | Volatility % | Green ≥ 1% |
+| P&L | Position profit/loss | Green/Red |
+
+### Backtest Results:
+- **Period**: 14 days (March 2026)
+- **Trades**: 23
+- **Win Rate**: 65.2%
+- **Net Return**: +$192.66 (+2.66%)
+- **Daily P&L**: $13.76/day
+- **Annualized**: ~48%
 
 ## Tick Mode & Multi-Core Processing
 
@@ -100,8 +116,9 @@ Trading strategies are stored in `models.json` and viewable at http://localhost:
 ### Current Models
 | Model | Description | Status |
 |-------|-------------|--------|
-| **SCALP_TICK** | Fast mean-reversion scalping (buy dips, target 0.18%, stop 0.12%) | **Active** |
+| **SELECTIVE_RSI** | Mean reversion: Buy oversold (RSI<25) + volume spike + ATR filter | **Active** |
 | **ALPHA_ENGINE** | 6-signal confluence filter (breakout, volume, ATR, RSI, regime, sentiment) | Saved |
+| **SCALP_TICK** | DEPRECATED - Not profitable with $2 commission costs | Deprecated |
 | **SCALP_ML_V1** | LightGBM ML scalping (12 features, 30s prediction) | Saved |
 | **BREAKOUT** | Raw price breakout detection | Saved |
 | **RSI_SWING** | Buy oversold, sell overbought | Saved |
@@ -121,26 +138,49 @@ Trading strategies are stored in `models.json` and viewable at http://localhost:
 4. Add config to `.env` if needed
 5. Update dashboard column in `src/multi_dashboard.py` if displaying new data
 
-### SCALP_TICK (Current Active Model)
-Fast tick-based scalping using mean reversion. Buys dips, sells bounces.
+### SELECTIVE_RSI (Current Active Model)
+Selective mean reversion strategy with multiple confirmation filters.
 
-**Entry Logic (MEAN_REVERSION):**
-- Buys when price DROPS 0.20% in 20 ticks (catching dips)
-- Targets quick 0.18% profit
-- Stops at 0.12% loss
-- Max hold: 50 ticks (~5 seconds)
-- Cooldown: 30 ticks between trades
+**Entry Logic:**
+- BUY when RSI < 25 (oversold)
+- AND relative volume > 1.0x average (volume confirmation)
+- AND ATR > 1% (sufficient volatility)
+- Max 5 concurrent positions
+- Prioritize most oversold stocks first
+
+**Exit Logic:**
+- SELL when RSI > 70 (overbought)
+- OR profit target +12% reached
+- OR stop loss -8% hit
+
+**Backtest Results (14 days, 71 stocks):**
+- 23 trades, 65.2% win rate
+- +$192.66 profit ($13.76/day)
+- ~48% annualized return
+- Commission: $46 total
 
 **Parameters:**
 ```bash
-SCALP_STRATEGY=MEAN_REVERSION
-SCALP_LOOKBACK_TICKS=20
-SCALP_ENTRY_PCT=0.20
-SCALP_TARGET_PCT=0.18
-SCALP_STOP_PCT=0.12
-SCALP_MAX_HOLD_TICKS=50
-SCALP_COOLDOWN_TICKS=30
+STRATEGY_TYPE=SELECTIVE_RSI
+SELECTIVE_RSI_PERIOD=14
+SELECTIVE_RSI_OVERSOLD=25
+SELECTIVE_RSI_OVERBOUGHT=70
+SELECTIVE_VOLUME_MULT=1.0
+SELECTIVE_ATR_MIN=0.01
+SELECTIVE_STOP_LOSS=0.08
+SELECTIVE_PROFIT_TARGET=0.12
+SELECTIVE_MAX_POSITIONS=5
 ```
+
+**Files:**
+- `src/selective_rsi_strategy.py` - Strategy implementation
+- `backtest_selective.py` - Backtest script
+
+### Why Scalping Failed
+SCALP_TICK was deprecated because transaction costs (0.25% = $2 commission + spread per trade) exceeded the strategy edge:
+- Original scalp: 697 trades, 0.7% win rate, -$1,725 loss
+- Even optimized swing: 37 trades, 43% win rate, only $6 profit
+- **Conclusion**: Scalping with $2 commission on $1000 positions cannot overcome costs
 
 ### Alpha Engine
 Generates BUY signals based on 6 weighted alpha signals:
@@ -274,18 +314,21 @@ cd C:\ClaudeSpace\trading-bot && python multi_bot.py
 - **Sector analysis**: /sectors page shows allocation
 
 ### Dashboard Columns:
-- **Symbol**: Stock ticker
+- **Symbol**: Stock ticker with company name
 - **Category**: Sector classification
 - **Event**: Days until earnings
-- **Price**: Current price with 24H change
-- **24H**: Sparkline chart
+- **Price**: Current price with change %
 - **Pos**: Current position (shares held)
 - **Target**: Target position size
-- **Data**: Price bars collected (X/60)
+- **Data**: Warmup status (ticks/required)
+- **StopOut**: Stop loss or trailing stop status
 - **Signal**: BUY/SELL/HOLD with visual bar
-- **Range High**: 60-period high (breakout level)
-- **Range Low**: 60-period low (breakdown level)
-- **News**: Sentiment bar (red=negative, green=positive)
+- **RSI**: RSI value (green < 25, red > 70)
+- **Rel Vol**: Relative volume vs average (green ≥ 1.0x)
+- **ATR%**: ATR as % of price (green ≥ 1%)
+- **P&L**: Position profit/loss %
+- **Sentiment**: News sentiment (VADER)
+- **MSI Beta**: Beta vs MSCI World (URTH)
 
 ## Project Structure
 ```

@@ -184,6 +184,8 @@ class StockTrader:
         self.last_intraday_update = 0
         # Beta vs MSCI World (URTH)
         self.beta = None
+        # Analyst ratings (Buy/Hold/Sell)
+        self.analyst_ratings = None
 
     def get_state(self, lightweight: bool = False, regime: str = "UNKNOWN") -> dict:
         """Get current state for dashboard. Use lightweight=True for WebSocket updates."""
@@ -287,6 +289,7 @@ class StockTrader:
             'alpha_components': alpha_components,  # Individual signal values
             'regime': regime,  # Market regime
             'beta': self.beta,  # Beta vs MSCI World (URTH)
+            'analyst_ratings': self.analyst_ratings,  # Buy/Hold/Sell counts
         }
 
         # Only include heavy data for full state requests (not WebSocket)
@@ -1059,6 +1062,9 @@ class MultiStockBot:
                     high = ticker.high if ticker.high and not util.isNan(ticker.high) else price
                     low = ticker.low if ticker.low and not util.isNan(ticker.low) else price
                     self.selective_rsi.add_bar(symbol, price, high, low, volume)
+                    # Update today's cumulative volume from IBKR (for rel_vol calculation)
+                    if ticker.volume and not util.isNan(ticker.volume) and ticker.volume > 0:
+                        self.selective_rsi.update_today_volume(symbol, ticker.volume)
                 trader.strategy.add_price(price)
             elif trader.strategy_type == "SCALP_TICK":
                 # Tick scalper processes every tick directly
@@ -1346,6 +1352,11 @@ class MultiStockBot:
         # Check entry signal
         should_buy, context = self.selective_rsi.check_entry_signal(symbol)
 
+        # Log when RSI is low but filters block (useful for debugging)
+        rsi = context.get('rsi')
+        if rsi is not None and rsi < self.selective_rsi.config.rsi_oversold and not should_buy:
+            logger.info(f"[SELECTIVE RSI] {symbol}: RSI={rsi:.1f} but BLOCKED: {context.get('reason', 'unknown')}")
+
         if should_buy:
             trader.position = self.get_position(trader)
             if trader.position == 0:
@@ -1357,6 +1368,8 @@ class MultiStockBot:
                         'shares': trader.position_size
                     }
                     self.symbol_last_trade[symbol] = current_time
+            else:
+                logger.info(f"[SELECTIVE RSI] {symbol}: Signal but already has position ({trader.position} shares)")
 
     def update_cash_balance(self):
         """Update available cash and net liquidation (cached, updated every 60s)"""
@@ -1682,6 +1695,11 @@ class MultiStockBot:
                     news = self.yfinance_client.get_news(symbol, limit=3)
                     trader.news = news
 
+                    # Fetch analyst ratings (Buy/Hold/Sell)
+                    analyst = self.yfinance_client.get_analyst_ratings(symbol)
+                    if analyst:
+                        trader.analyst_ratings = analyst
+
                     trader.last_info_update = current_time
                     if events:  # Only count if we got data
                         events_updated += 1
@@ -1922,7 +1940,7 @@ class MultiStockBot:
 
                 state['selective_rsi'] = {
                     'rsi': round(rsi or 0, 1),
-                    'rel_vol': round(rel_vol or 0, 2),
+                    'rel_vol': round(rel_vol, 2) if rel_vol is not None else None,
                     'atr_pct': round((atr_pct or 0) * 100, 2),  # Convert to %
                 }
 

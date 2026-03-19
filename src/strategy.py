@@ -355,8 +355,6 @@ class SimpleStrategy:
         rsi = self.get_current_rsi()
         rel_volume = self.get_relative_volume()
 
-        logger.info(f"MA({self.short_window}): ${short_ma:.4f}, MA({self.long_window}): ${long_ma:.4f}, RSI: {rsi:.1f}, RelVol: {rel_volume:.2f}x")
-
         # === EARNINGS SIGNAL OVERRIDE ===
         # If earnings just came out with strong signal, it can override other filters
         earnings_buy, earnings_buy_reason = self.check_earnings_buy_signal()

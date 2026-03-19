@@ -963,12 +963,19 @@ class MarketStateEngine:
             if trend_comparison:
                 result['market_describers']['trend_comparison'] = trend_comparison
 
-            # Sector ETFs for Factor Rotation
+            # Sector ETFs for Factor Rotation (all 11 GICS sectors)
             sector_etfs = {
                 'XLK': 'Tech',
                 'XLF': 'Financials',
                 'XLE': 'Energy',
-                'XLV': 'Healthcare'
+                'XLV': 'Healthcare',
+                'XLY': 'Cons Disc',
+                'XLP': 'Cons Staples',
+                'XLI': 'Industrials',
+                'XLB': 'Materials',
+                'XLRE': 'Real Estate',
+                'XLU': 'Utilities',
+                'XLC': 'Comm Svcs'
             }
 
             sector_histories = {}
@@ -998,7 +1005,13 @@ class MarketStateEngine:
                             relative_perf = sector_return - spy_return
                             perf_data.append({'date': date_str, 'value': relative_perf})
 
-                    color = '#3fb950' if sector_name == 'Tech' else '#58a6ff' if sector_name == 'Financials' else '#f0883e' if sector_name == 'Energy' else '#a371f7'
+                    # Assign distinct colors to each sector
+                    sector_colors = {
+                        'Tech': '#3fb950', 'Financials': '#58a6ff', 'Energy': '#f0883e', 'Healthcare': '#a371f7',
+                        'Cons Disc': '#f85149', 'Cons Staples': '#56d4dd', 'Industrials': '#db61a2',
+                        'Materials': '#7ee787', 'Real Estate': '#ffa657', 'Utilities': '#79c0ff', 'Comm Svcs': '#d2a8ff'
+                    }
+                    color = sector_colors.get(sector_name, '#8b949e')
                     result['directional_describers'][f'sector_{sector_name.lower()}'] = {
                         'name': f'{sector_name} vs SPY',
                         'data': perf_data,
@@ -1020,6 +1033,49 @@ class MarketStateEngine:
                     'data': risk_data,
                     'color': '#3fb950',
                     'unit': ''
+                }
+
+            # Buffett Indicator: Market Cap / GDP ratio
+            # Use Wilshire 5000 (^W5000) or VTI as proxy for total market cap
+            wilshire_history = self.yf_client.get_history('^W5000', period=period, interval='1d')
+            if not wilshire_history:
+                # Fallback to VTI (Vanguard Total Market ETF)
+                wilshire_history = self.yf_client.get_history('VTI', period=period, interval='1d')
+
+            if wilshire_history:
+                buffett_data = []
+                # US GDP estimate: ~$28.5T in 2024, growing ~2.5%/year
+                # Wilshire 5000 index ≈ total market cap in billions
+                # For VTI, scale up (VTI price * ~55B shares outstanding / 1000)
+                is_vti = wilshire_history[0]['close'] < 1000  # VTI is ~$250, Wilshire is ~50000
+
+                for h in wilshire_history:
+                    date_str = h['date'].strftime('%Y-%m-%d') if hasattr(h['date'], 'strftime') else str(h['date'])[:10]
+
+                    # Estimate GDP for this date (quarterly growth approximation)
+                    try:
+                        date_obj = h['date'] if hasattr(h['date'], 'year') else datetime.strptime(date_str, '%Y-%m-%d')
+                        years_from_2024 = (date_obj.year - 2024) + (date_obj.month - 1) / 12
+                        gdp_estimate = 28.5 * (1.025 ** years_from_2024)  # GDP in trillions
+                    except:
+                        gdp_estimate = 28.5
+
+                    # Calculate market cap / GDP ratio
+                    if is_vti:
+                        # VTI: approximate market cap = price * 220 (scaling factor to get ~$55T market cap)
+                        market_cap = h['close'] * 220  # Results in market cap in trillions
+                    else:
+                        # Wilshire 5000: index value ≈ market cap in billions, divide by 1000 for trillions
+                        market_cap = h['close'] / 1000
+
+                    buffett_ratio = (market_cap / gdp_estimate) * 100  # As percentage
+                    buffett_data.append({'date': date_str, 'value': round(buffett_ratio, 1)})
+
+                result['directional_describers']['buffett_indicator'] = {
+                    'name': 'Buffett Indicator (Market Cap/GDP)',
+                    'data': buffett_data,
+                    'color': '#ffa657',
+                    'unit': '%'
                 }
 
         except Exception as e:

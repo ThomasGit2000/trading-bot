@@ -88,6 +88,33 @@
         "note": "Trend following with hold periods"
       }
     },
+    "SELECTIVE_RSI": {
+      "name": "Selective RSI (Mean Reversion)",
+      "description": "Buy oversold stocks (RSI<25) with volume confirmation (>1x avg) and volatility filter (ATR>1%). Sell on overbought (RSI>70), +12% target, or -8% stop. Max 5 positions.",
+      "status": "active",
+      "parameters": {
+        "STRATEGY_TYPE": "SELECTIVE_RSI",
+        "RSI_PERIOD": 14,
+        "RSI_OVERSOLD": 25,
+        "RSI_OVERBOUGHT": 70,
+        "VOLUME_MULTIPLIER": 1.0,
+        "ATR_MIN_PCT": 0.01,
+        "STOP_LOSS_PCT": 0.08,
+        "PROFIT_TARGET_PCT": 0.12,
+        "MAX_POSITIONS": 5
+      },
+      "backtest_results": {
+        "net_return": 2.66,
+        "win_rate": 65.2,
+        "trades": 23,
+        "commission": 46,
+        "period": "14 days (Mar 2026)",
+        "stocks": 71,
+        "daily_pnl_usd": 13.76,
+        "annualized_return_pct": 48,
+        "note": "PROFITABLE: +$192.66 over 14 days = $14/day = 48% annualized. Buy oversold (RSI<25) + volume spike + ATR filter."
+      }
+    },
     "ALPHA_ENGINE": {
       "name": "Alpha Engine (Confluence Filter)",
       "description": "Combines 6 alpha signals (breakout, volume, ATR, RSI, regime, sentiment) with weighted scoring. Filters trades that don't meet confluence threshold.",
@@ -135,8 +162,8 @@
     },
     "SCALP_TICK": {
       "name": "Tick Scalper (Mean Reversion)",
-      "description": "Fast momentum scalping on tick data. Buys dips (0.20% drop in 20 ticks), targets 0.18%, stops at 0.12%. Max hold 50 ticks.",
-      "status": "active",
+      "description": "DEPRECATED - Not profitable with current cost structure. Transaction costs (0.25% = $2 commission + spread) exceed strategy edge.",
+      "status": "deprecated",
       "parameters": {
         "STRATEGY_TYPE": "SCALP_TICK",
         "SCALP_STRATEGY": "MEAN_REVERSION",
@@ -148,9 +175,29 @@
         "SCALP_COOLDOWN_TICKS": 30
       },
       "backtest_results": {
-        "note": "Live testing in progress"
+        "period": "8 days (Mar 8-17, 2026)",
+        "data_files": 230,
+        "original_settings": {
+          "entry": "-0.20%",
+          "target": "+0.18%",
+          "stop": "-0.12%",
+          "trades": 697,
+          "win_rate": "0.7%",
+          "pnl_usd": -1724.63,
+          "note": "Massive loss - stops hit constantly"
+        },
+        "optimized_swing": {
+          "entry": "-1.0%",
+          "target": "+1.5%",
+          "stop": "-1.0%",
+          "trades": 37,
+          "win_rate": "43.2%",
+          "pnl_usd": 5.97,
+          "note": "Break-even after costs - not viable"
+        },
+        "conclusion": "Scalping with $2 commission on $1000 positions = 0.25% cost per trade. Strategy cannot overcome costs. Need larger positions or lower commissions."
       }
     }
   },
-  "active_model": "SCALP_TICK"
+  "active_model": "SELECTIVE_RSI"
 }

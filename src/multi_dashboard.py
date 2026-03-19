@@ -332,10 +332,11 @@ DASHBOARD_HTML = """
                 <th title="Position P&L %">P&L</th>
                 <th title="News Sentiment Signal">Sentiment</th>
                 <th class="sortable" data-sort="beta" onclick="sortTable('beta')" title="Beta vs MSCI World (URTH)">MSI Beta <span class="sort-arrow"></span></th>
+                <th class="sortable" data-sort="analyst" onclick="sortTable('analyst')" title="Analyst Ratings (Buy/Hold/Sell)">Analyst <span class="sort-arrow"></span></th>
             </tr>
         </thead>
         <tbody id="stocks-body">
-            <tr><td colspan="15" style="text-align:center;color:#8b949e;">Loading...</td></tr>
+            <tr><td colspan="16" style="text-align:center;color:#8b949e;">Loading...</td></tr>
         </tbody>
     </table>
 
@@ -455,6 +456,7 @@ DASHBOARD_HTML = """
                         <div class="info-row"><span class="info-label">EPS</span><span id="modal-eps" class="info-value">--</span></div>
                         <div class="info-row"><span class="info-label">52W Range</span><span id="modal-52w" class="info-value">--</span></div>
                         <div class="info-row"><span class="info-label">Beta</span><span id="modal-beta" class="info-value">--</span></div>
+                        <div class="info-row"><span class="info-label">Analyst (B/H/S)</span><span id="modal-analyst" class="info-value">--</span></div>
                         <div class="info-row"><span class="info-label">Sector</span><span id="modal-sector" class="info-value">--</span></div>
                     </div>
                     <div class="card">
@@ -471,10 +473,19 @@ DASHBOARD_HTML = """
                             </div>
                         </div>
                     </div>
-                    <div class="card" style="max-height: 300px; overflow-y: auto;">
-                        <div class="card-title">News</div>
-                        <div id="modal-news">Loading...</div>
+                </div>
+                <!-- Full-width Analyst Ratings section -->
+                <div class="card" style="margin-top:16px; max-height: 280px; overflow-y: auto;">
+                    <div class="card-title">
+                        Analyst Ratings
+                        <span id="analyst-consensus" style="float:right;font-size:12px;"></span>
                     </div>
+                    <div id="modal-analysts">Loading...</div>
+                </div>
+                <!-- Full-width News section -->
+                <div class="card" style="margin-top:16px; max-height: 350px; overflow-y: auto;">
+                    <div class="card-title">News</div>
+                    <div id="modal-news">Loading...</div>
                 </div>
             </div>
         </div>
@@ -528,7 +539,7 @@ DASHBOARD_HTML = """
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 10000);  // 10s timeout
 
-                const res = await fetch('/api/stocks', { signal: controller.signal });
+                const res = await fetch('/api/stocks?_=' + Date.now(), { signal: controller.signal, cache: 'no-store' });
                 clearTimeout(timeoutId);
                 const data = await res.json();
 
@@ -579,12 +590,12 @@ DASHBOARD_HTML = """
 
         function connect() {
             console.log('Starting dashboard polling...');
-            // Poll every 3 seconds for price updates
+            // Poll every 1 second for price updates
             fetchData();
             setInterval(() => {
                 console.log('Poll interval triggered');
                 fetchData();
-            }, 3000);
+            }, 1000);
             // Fetch activity logs every 10 seconds
             fetchActivityLogs();
             setInterval(fetchActivityLogs, 10000);
@@ -870,6 +881,13 @@ DASHBOARD_HTML = """
                     valA = (a.selective_rsi || {}).rsi || a.rsi || 0;
                     valB = (b.selective_rsi || {}).rsi || b.rsi || 0;
                 }
+                if (column === 'analyst') {
+                    // Sort by (buy - sell) difference
+                    const rA = a.analyst_ratings || {};
+                    const rB = b.analyst_ratings || {};
+                    valA = (rA.buy || 0) - (rA.sell || 0);
+                    valB = (rB.buy || 0) - (rB.sell || 0);
+                }
 
                 // Handle null/undefined
                 if (valA == null) valA = '';
@@ -1065,8 +1083,31 @@ DASHBOARD_HTML = """
                     <td style="text-align:center;">${formatPnL(pnlPct, inPosition)}</td>
                     <td style="text-align:center;">${formatSentiment(sentimentVal)}</td>
                     <td style="text-align:center;">${formatBeta(betaVal)}</td>
+                    <td style="text-align:center;">${formatAnalystRating(s.analyst_ratings)}</td>
                 </tr>
             `;
+        }
+
+        function formatAnalystRating(ratings) {
+            if (!ratings) return '<span style="color:#8b949e;">--</span>';
+
+            const buy = ratings.buy || 0;
+            const hold = ratings.hold || 0;
+            const sell = ratings.sell || 0;
+            const total = buy + hold + sell;
+
+            if (total === 0) return '<span style="color:#8b949e;">--</span>';
+
+            let color;
+            if (buy > sell) {
+                color = '#3fb950';  // Green - more buys
+            } else if (sell > buy) {
+                color = '#f85149';  // Red - more sells
+            } else {
+                color = '#8b949e';  // Gray - even
+            }
+
+            return `<span style="color:${color};font-weight:600;font-size:11px;" title="Buy: ${buy}, Hold: ${hold}, Sell: ${sell}">${buy}/${hold}/${sell}</span>`;
         }
 
         function formatAlphaScore(score) {
@@ -1371,6 +1412,7 @@ DASHBOARD_HTML = """
                 loadStockInfo(symbol),
                 loadStockNews(symbol),
                 loadStockEvents(symbol),
+                loadAnalystList(symbol),
                 loadChart(symbol, '1mo', '1d')
             ]);
 
@@ -1460,6 +1502,22 @@ DASHBOARD_HTML = """
                 document.getElementById('modal-eps').textContent = data.eps ? '$' + data.eps.toFixed(2) : '--';
                 document.getElementById('modal-52w').textContent = (data.fiftyTwoWeekLow ? '$' + data.fiftyTwoWeekLow.toFixed(2) : '--') + ' - ' + (data.fiftyTwoWeekHigh ? '$' + data.fiftyTwoWeekHigh.toFixed(2) : '--');
                 document.getElementById('modal-beta').textContent = data.beta ? data.beta.toFixed(2) : '--';
+
+                // Analyst ratings with color coding
+                const analystEl = document.getElementById('modal-analyst');
+                if (data.analyst_ratings) {
+                    const r = data.analyst_ratings;
+                    const buy = r.buy || 0;
+                    const hold = r.hold || 0;
+                    const sell = r.sell || 0;
+                    let color = '#8b949e';  // Gray default
+                    if (buy > sell) color = '#3fb950';  // Green
+                    else if (sell > buy) color = '#f85149';  // Red
+                    analystEl.innerHTML = `<span style="color:${color};font-weight:600;">${buy}/${hold}/${sell}</span>`;
+                } else {
+                    analystEl.textContent = '--';
+                }
+
                 document.getElementById('modal-sector').textContent = data.sector || '--';
             } catch (e) {
                 console.error('Error loading stock info:', e);
@@ -1561,6 +1619,67 @@ DASHBOARD_HTML = """
             } catch (e) {
                 console.error('Error loading news:', e);
                 document.getElementById('modal-news').innerHTML = '<div style="color:#8b949e;">Error loading news</div>';
+            }
+        }
+
+        async function loadAnalystList(symbol) {
+            try {
+                const res = await fetch('/api/stock/' + symbol + '/analysts');
+                const data = await res.json();
+
+                // Update consensus display
+                const consensusEl = document.getElementById('analyst-consensus');
+                if (data.consensus && data.consensus.rating) {
+                    const mean = data.consensus.mean || 3;
+                    let color = '#8b949e';
+                    if (mean <= 2) color = '#3fb950';      // Strong Buy/Buy
+                    else if (mean >= 4) color = '#f85149'; // Sell/Strong Sell
+                    else color = '#f0883e';                // Hold
+                    consensusEl.innerHTML = `<span style="color:${color};font-weight:600;">Consensus: ${data.consensus.rating}</span>`;
+                } else {
+                    consensusEl.textContent = '';
+                }
+
+                const el = document.getElementById('modal-analysts');
+                if (!data.analysts || data.analysts.length === 0) {
+                    el.innerHTML = '<div style="color:#8b949e;">No analyst data available</div>';
+                    return;
+                }
+
+                // Create table
+                let html = `
+                    <table style="width:100%;font-size:11px;border-collapse:collapse;">
+                        <thead>
+                            <tr style="color:#8b949e;border-bottom:1px solid #30363d;">
+                                <th style="text-align:left;padding:4px;">Date</th>
+                                <th style="text-align:left;padding:4px;">Firm</th>
+                                <th style="text-align:left;padding:4px;">Rating</th>
+                                <th style="text-align:right;padding:4px;">Target</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                `;
+
+                for (const a of data.analysts) {
+                    html += `
+                        <tr style="border-bottom:1px solid #21262d;">
+                            <td style="padding:4px;color:#8b949e;">${a.date}</td>
+                            <td style="padding:4px;">${a.firm}</td>
+                            <td style="padding:4px;">
+                                <span style="color:${a.color};font-weight:600;">${a.action} ${a.rating}</span>
+                                <span style="color:#6e7681;font-size:10px;"> (${a.grade})</span>
+                            </td>
+                            <td style="padding:4px;text-align:right;">${a.price_target ? '$' + a.price_target.toFixed(0) : '--'}</td>
+                        </tr>
+                    `;
+                }
+
+                html += '</tbody></table>';
+                el.innerHTML = html;
+
+            } catch (e) {
+                console.error('Error loading analysts:', e);
+                document.getElementById('modal-analysts').innerHTML = '<div style="color:#8b949e;">Error loading analyst data</div>';
             }
         }
 
@@ -1980,13 +2099,14 @@ SECTORS_HTML = """
                 document.getElementById('portfolio-beta').textContent = portfolioBeta > 0 ? portfolioBeta.toFixed(2) : '--';
 
                 // Update portfolio sentiment with color coding
+                // Note: news_sentiment is already scaled -100 to +100 in bot
                 const sentimentEl = document.getElementById('portfolio-sentiment');
                 if (totalInvested > 0) {
-                    const sentimentDisplay = (portfolioSentiment * 100).toFixed(0);
+                    const sentimentDisplay = portfolioSentiment.toFixed(0);
                     sentimentEl.textContent = sentimentDisplay;
-                    if (portfolioSentiment >= 0.1) {
+                    if (portfolioSentiment >= 10) {
                         sentimentEl.style.color = '#3fb950';  // green
-                    } else if (portfolioSentiment <= -0.1) {
+                    } else if (portfolioSentiment <= -10) {
                         sentimentEl.style.color = '#f85149';  // red
                     } else {
                         sentimentEl.style.color = '#8b949e';  // neutral gray
@@ -2963,9 +3083,15 @@ MARKET_HTML = """
             <div style="font-size: 14px; font-weight: 600; margin-bottom: 12px; color: #8b949e;">
                 Sector Performance vs SPY (1 Year)
             </div>
+            <div style="height: 270px;"><canvas id="chart-sectors"></canvas></div>
+        </div>
+        <div style="margin-top: 20px; background: #161b22; border-radius: 8px; padding: 16px; border: 1px solid #30363d;">
+            <div style="font-size: 14px; font-weight: 600; margin-bottom: 12px; color: #8b949e;">
+                Market Indicators
+            </div>
             <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px;">
-                <div style="height: 180px;"><canvas id="chart-sectors"></canvas></div>
-                <div style="height: 180px;"><canvas id="chart-risk-appetite"></canvas></div>
+                <div style="height: 270px;"><canvas id="chart-risk-appetite"></canvas></div>
+                <div style="height: 270px;"><canvas id="chart-buffett"></canvas></div>
             </div>
         </div>
     </div>
@@ -3560,7 +3686,10 @@ MARKET_HTML = """
             }
 
             const datasets = [];
-            const colors = ['#3fb950', '#58a6ff', '#f0883e', '#a371f7'];
+            const colors = [
+                '#3fb950', '#58a6ff', '#f0883e', '#a371f7', '#f85149',
+                '#56d4dd', '#db61a2', '#7ee787', '#ffa657', '#79c0ff', '#d2a8ff'
+            ];
             let i = 0;
 
             for (const [key, sector] of Object.entries(sectorsData)) {
@@ -3689,6 +3818,11 @@ MARKET_HTML = """
                 // Risk appetite chart
                 if (dd.risk_appetite) {
                     createHistoryChart('chart-risk-appetite', dd.risk_appetite.data, dd.risk_appetite.name, dd.risk_appetite.color, '');
+                }
+
+                // Buffett Indicator (Market Cap / GDP)
+                if (dd.buffett_indicator) {
+                    createHistoryChart('chart-buffett', dd.buffett_indicator.data, dd.buffett_indicator.name, dd.buffett_indicator.color, '%');
                 }
 
             } catch (e) {
@@ -4653,7 +4787,16 @@ async def activate_model(model_key: str):
 @app.get("/api/stocks")
 async def get_stocks():
     import asyncio
-    return await asyncio.to_thread(read_state_file)
+    from fastapi.responses import JSONResponse
+    data = await asyncio.to_thread(read_state_file)
+    return JSONResponse(
+        content=data,
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+    )
 
 
 @app.get("/api/models/active")
@@ -4817,6 +4960,7 @@ async def get_stock_history(symbol: str, period: str = "1mo", interval: str = "1
 async def get_stock_info(symbol: str):
     """Get company fundamentals"""
     info = yf_client.get_info(symbol.upper())
+    analyst = yf_client.get_analyst_ratings(symbol.upper())
     return {
         "symbol": symbol.upper(),
         "name": info.get("shortName", symbol),
@@ -4828,6 +4972,7 @@ async def get_stock_info(symbol: str):
         "fiftyTwoWeekHigh": info.get("fiftyTwoWeekHigh"),
         "fiftyTwoWeekLow": info.get("fiftyTwoWeekLow"),
         "beta": info.get("beta"),
+        "analyst_ratings": analyst if analyst else None,
         "bid": info.get("bid"),
         "ask": info.get("ask"),
         "bidSize": info.get("bidSize"),
@@ -4837,6 +4982,25 @@ async def get_stock_info(symbol: str):
         "dayLow": info.get("dayLow"),
         "volume": info.get("volume"),
         "avgVolume": info.get("averageVolume")
+    }
+
+
+@app.get("/api/stock/{symbol}/analysts")
+async def get_stock_analysts(symbol: str, limit: int = 20):
+    """Get list of analyst ratings with firm names"""
+    analysts = yf_client.get_analyst_list(symbol.upper(), limit=limit)
+    # Get consensus data
+    info = yf_client.get_info(symbol.upper())
+    consensus = {
+        "mean": info.get("recommendationMean"),  # 1=Strong Buy, 5=Sell
+        "key": info.get("recommendationKey"),    # buy, hold, sell, etc.
+        "count": info.get("numberOfAnalystOpinions"),
+        "rating": info.get("averageAnalystRating")  # "1.9 - Buy"
+    }
+    return {
+        "symbol": symbol.upper(),
+        "analysts": analysts,
+        "consensus": consensus
     }
 
 

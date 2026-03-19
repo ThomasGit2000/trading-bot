@@ -60,6 +60,9 @@ class SelectiveRSIStrategy:
         self._atr_cache: Dict[str, float] = {}
         self._rel_vol_cache: Dict[str, float] = {}
 
+        # Today's cumulative volume (from IBKR ticker.volume)
+        self._today_volume: Dict[str, float] = {}
+
     def _init_symbol(self, symbol: str):
         """Initialize data structures for a new symbol."""
         if symbol not in self.prices:
@@ -98,16 +101,21 @@ class SelectiveRSIStrategy:
 
         # Check if bar interval has elapsed
         if current_time - bar['start_time'] >= self.config.bar_interval_sec:
-            # Complete the bar - add to history
+            # Complete the bar - add to history for RSI/ATR calculation
             self.prices[symbol].append(bar['close'])
             self.highs[symbol].append(bar['high'])
             self.lows[symbol].append(bar['low'])
-            self.volumes[symbol].append(bar['volume'])
+            # NOTE: Don't append minute volumes to daily volumes deque!
+            # The volumes deque contains daily volumes from historical data.
+            # Mixing minute volumes (thousands) with daily volumes (millions)
+            # corrupts the relative volume calculation.
+            # self.volumes[symbol].append(bar['volume'])  # DISABLED
 
-            # Clear cache for this symbol (indicators need recalculation)
+            # Clear cache for RSI and ATR (prices changed)
+            # But keep rel_vol cache (volumes unchanged - still daily data)
             self._rsi_cache.pop(symbol, None)
             self._atr_cache.pop(symbol, None)
-            self._rel_vol_cache.pop(symbol, None)
+            # self._rel_vol_cache.pop(symbol, None)  # Keep rel_vol cache
 
             # Start new bar
             self._current_bar[symbol] = {
@@ -132,6 +140,13 @@ class SelectiveRSIStrategy:
         self._rsi_cache.pop(symbol, None)
         self._atr_cache.pop(symbol, None)
         self._rel_vol_cache.pop(symbol, None)
+
+    def update_today_volume(self, symbol: str, cumulative_volume: float):
+        """Update today's cumulative volume from IBKR ticker.volume."""
+        if cumulative_volume and cumulative_volume > 0:
+            self._today_volume[symbol] = cumulative_volume
+            # Clear rel_vol cache when today's volume updates
+            self._rel_vol_cache.pop(symbol, None)
 
     def add_price(self, symbol: str, price: float, volume: float = 0):
         """Add price tick (uses price for high/low)."""
@@ -220,9 +235,14 @@ class SelectiveRSIStrategy:
 
         return atr / current_price
 
-    def compute_relative_volume(self, symbol: str) -> Optional[float]:
-        """Compute relative volume vs average."""
-        if symbol in self._rel_vol_cache:
+    def compute_relative_volume(self, symbol: str, include_current_bar: bool = False) -> Optional[float]:
+        """Compute relative volume vs expected volume for this time of day.
+
+        Uses today's cumulative volume from IBKR (ticker.volume) compared
+        against the expected volume at this point in the trading day.
+        rel_vol = 1.0 means normal volume for this time of day.
+        """
+        if not include_current_bar and symbol in self._rel_vol_cache:
             return self._rel_vol_cache[symbol]
 
         if symbol not in self.volumes:
@@ -230,18 +250,46 @@ class SelectiveRSIStrategy:
 
         volumes = list(self.volumes[symbol])
 
-        if len(volumes) < 2:
+        if len(volumes) < 1:
             return None
 
-        current_vol = volumes[-1]
-        avg_vol = np.mean(volumes[:-1])
+        # Use today's cumulative volume from IBKR if available
+        if symbol in self._today_volume and self._today_volume[symbol] > 0:
+            current_vol = self._today_volume[symbol]
+        else:
+            # Fallback to last historical volume (yesterday)
+            current_vol = volumes[-1] if volumes else 0
+
+        # Average of historical daily volumes
+        avg_vol = np.mean(volumes) if volumes else 0
 
         if avg_vol <= 0:
             rel_vol = 1.0
         else:
-            rel_vol = current_vol / avg_vol
+            # Adjust for time of day (trading hours 9:30-16:00 ET = 390 minutes)
+            from datetime import datetime
+            import pytz
+            et = pytz.timezone('America/New_York')
+            now = datetime.now(et)
+            market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+            market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
 
-        self._rel_vol_cache[symbol] = rel_vol
+            # Calculate elapsed fraction of trading day
+            if now < market_open:
+                time_fraction = 0.01  # Pre-market, use small fraction
+            elif now > market_close:
+                time_fraction = 1.0  # After hours, use full day
+            else:
+                elapsed_minutes = (now - market_open).total_seconds() / 60
+                total_minutes = 390  # 6.5 hours
+                time_fraction = max(0.01, elapsed_minutes / total_minutes)
+
+            # Expected volume at this time = avg_vol * time_fraction
+            expected_vol = avg_vol * time_fraction
+            rel_vol = current_vol / expected_vol
+
+        if not include_current_bar:
+            self._rel_vol_cache[symbol] = rel_vol
         return rel_vol
 
     def get_current_price(self, symbol: str) -> Optional[float]:
@@ -261,7 +309,8 @@ class SelectiveRSIStrategy:
         Returns:
             (should_buy, context_dict)
         """
-        rsi = self.compute_rsi(symbol)
+        # Use include_current_bar=True to match dashboard display
+        rsi = self.compute_rsi(symbol, include_current_bar=True)
         rel_vol = self.compute_relative_volume(symbol)
         atr_pct = self.compute_atr_pct(symbol)
 
@@ -282,11 +331,17 @@ class SelectiveRSIStrategy:
             context['reason'] = f'RSI {rsi:.1f} >= {self.config.rsi_oversold}'
             return False, context
 
-        if rel_vol is None or rel_vol < self.config.volume_multiplier:
+        if rel_vol is None:
+            context['reason'] = 'Insufficient data for Volume'
+            return False, context
+        if rel_vol < self.config.volume_multiplier:
             context['reason'] = f'Volume {rel_vol:.2f}x < {self.config.volume_multiplier}x'
             return False, context
 
-        if atr_pct is None or atr_pct < self.config.atr_min_pct:
+        if atr_pct is None:
+            context['reason'] = 'Insufficient data for ATR'
+            return False, context
+        if atr_pct < self.config.atr_min_pct:
             context['reason'] = f'ATR {atr_pct*100:.2f}% < {self.config.atr_min_pct*100:.1f}%'
             return False, context
 
@@ -349,7 +404,7 @@ class SelectiveRSIStrategy:
         return {
             'rsi': self.compute_rsi(symbol, include_current_bar=True),  # Real-time RSI for display
             'atr_pct': self.compute_atr_pct(symbol),
-            'rel_vol': self.compute_relative_volume(symbol),
+            'rel_vol': self.compute_relative_volume(symbol),  # Use cached from completed bars (not current bar - mixes daily/minute volumes)
             'price': self.get_current_price(symbol),
             'bars': self.get_bars_count(symbol)
         }

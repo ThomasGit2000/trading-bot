@@ -338,6 +338,130 @@ class YFinanceClient:
                 logger.error(f"YFinance news error for {symbol}: {e}")
             return []
 
+    def get_analyst_ratings(self, symbol: str) -> dict:
+        """Get analyst recommendations (Buy/Hold/Sell counts)"""
+        cache_key = f"analyst:{symbol}"
+        cached = self._get_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        if not self._throttle():
+            return {}  # Rate limited
+
+        try:
+            ticker = yf.Ticker(symbol)
+
+            # Try to get recommendations summary
+            # yfinance provides: strongBuy, buy, hold, sell, strongSell
+            info = ticker.info
+            if info:
+                result = {
+                    'buy': (info.get('recommendationKey', '') in ['buy', 'strong_buy']) and 1 or 0,
+                    'hold': 0,
+                    'sell': 0
+                }
+
+                # Try to get detailed analyst counts from recommendations
+                try:
+                    recs = ticker.recommendations
+                    if recs is not None and len(recs) > 0:
+                        # Get most recent recommendation summary
+                        latest = recs.iloc[-1] if hasattr(recs, 'iloc') else None
+                        if latest is not None:
+                            result = {
+                                'buy': int(latest.get('strongBuy', 0) or 0) + int(latest.get('buy', 0) or 0),
+                                'hold': int(latest.get('hold', 0) or 0),
+                                'sell': int(latest.get('sell', 0) or 0) + int(latest.get('strongSell', 0) or 0)
+                            }
+                except Exception:
+                    # Fallback: use targetMeanPrice vs currentPrice as proxy
+                    target = info.get('targetMeanPrice', 0)
+                    current = info.get('currentPrice', 0) or info.get('regularMarketPrice', 0)
+                    if target and current and target > 0 and current > 0:
+                        upside = (target - current) / current
+                        if upside > 0.15:
+                            result = {'buy': 1, 'hold': 0, 'sell': 0}
+                        elif upside < -0.10:
+                            result = {'buy': 0, 'hold': 0, 'sell': 1}
+                        else:
+                            result = {'buy': 0, 'hold': 1, 'sell': 0}
+
+                self._set_cache(cache_key, result, self.CACHE_TTL_INFO)
+                return result
+
+            return {}
+        except Exception as e:
+            if 'RateLimit' in str(type(e).__name__) or 'rate' in str(e).lower():
+                self._handle_rate_limit()
+            else:
+                logger.debug(f"YFinance analyst error for {symbol}: {e}")
+            return {}
+
+    def get_analyst_list(self, symbol: str, limit: int = 20) -> list:
+        """Get list of recent analyst ratings with firm names and grades"""
+        cache_key = f"analyst_list:{symbol}"
+        cached = self._get_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        if not self._throttle():
+            return []  # Rate limited
+
+        try:
+            ticker = yf.Ticker(symbol)
+            upgrades = ticker.upgrades_downgrades
+
+            if upgrades is None or len(upgrades) == 0:
+                return []
+
+            results = []
+            for idx, row in upgrades.head(limit).iterrows():
+                # Parse date
+                date_str = str(idx)[:10] if idx else ''
+
+                # Map grade to Buy/Hold/Sell
+                grade = row.get('ToGrade', '')
+                grade_lower = grade.lower()
+                if any(x in grade_lower for x in ['buy', 'outperform', 'overweight', 'positive', 'accumulate']):
+                    rating = 'Buy'
+                    color = '#3fb950'
+                elif any(x in grade_lower for x in ['sell', 'underperform', 'underweight', 'negative', 'reduce']):
+                    rating = 'Sell'
+                    color = '#f85149'
+                else:
+                    rating = 'Hold'
+                    color = '#8b949e'
+
+                # Get action (upgrade/downgrade/maintain)
+                action = row.get('Action', '')
+                action_display = ''
+                if action == 'up':
+                    action_display = '↑'
+                elif action == 'down':
+                    action_display = '↓'
+                elif action in ['main', 'reit']:
+                    action_display = '→'
+
+                # Price target
+                price_target = row.get('currentPriceTarget', 0)
+
+                results.append({
+                    'date': date_str,
+                    'firm': row.get('Firm', 'Unknown'),
+                    'grade': grade,
+                    'rating': rating,
+                    'color': color,
+                    'action': action_display,
+                    'price_target': price_target if price_target and price_target > 0 else None
+                })
+
+            self._set_cache(cache_key, results, self.CACHE_TTL_INFO)
+            return results
+
+        except Exception as e:
+            logger.debug(f"YFinance analyst list error for {symbol}: {e}")
+            return []
+
     def _time_ago(self, dt) -> str:
         """Convert datetime to relative time string"""
         from datetime import datetime
